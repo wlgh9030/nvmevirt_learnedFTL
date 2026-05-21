@@ -4,9 +4,33 @@
 #define _NVMEVIRT_CONV_FTL_H
 
 #include <linux/types.h>
+#include <linux/list.h>
+#include <linux/hashtable.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
+
+#define CMT_CAPACITY 1024
+#define CMT_HASH_BITS 10
+#define CMT_HASH_SIZE (1 << CMT_HASH_BITS)
+#define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
+
+struct cmt_entry {
+	uint64_t lpn;
+	struct ppa ppa;
+	bool dirty;
+	struct list_head lru;
+	struct hlist_node hnode;
+};
+
+struct dftl_cmt {
+	struct cmt_entry *pool;
+	struct hlist_head ht[CMT_HASH_SIZE];
+	struct list_head lru_list;
+	struct list_head free_list;
+	uint32_t size;
+	uint32_t capacity;
+};
 
 struct convparams {
 	uint32_t gc_thres_lines;
@@ -59,7 +83,13 @@ struct conv_ftl {
 	struct ssd *ssd;
 
 	struct convparams cp;
-	struct ppa *maptbl; /* page level mapping table */
+	//struct ppa *maptbl; /* page level mapping table */
+
+	struct ppa *gtd;
+	struct dftl_cmt cmt;
+	uint32_t num_tp;
+	void *mapped;
+
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
 	struct write_pointer wp;
 	struct write_pointer gc_wp;

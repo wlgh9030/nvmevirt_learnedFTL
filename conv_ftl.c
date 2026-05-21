@@ -7,6 +7,11 @@
 #include "nvmev.h"
 #include "conv_ftl.h"
 
+static atomic64_t cmt_hits = ATOMIC64_INIT(0);
+static atomic64_t cmt_misses = ATOMIC64_INIT(0);
+static atomic64_t tp_loads = ATOMIC64_INIT(0);
+static atomic64_t tp_writebacks = ATOMIC64_INIT(0);
+
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -22,7 +27,7 @@ static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 {
 	return conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines_high;
 }
-
+/*
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
 	return conv_ftl->maptbl[lpn];
@@ -33,14 +38,14 @@ static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struc
 	NVMEV_ASSERT(lpn < conv_ftl->ssd->sp.tt_pgs);
 	conv_ftl->maptbl[lpn] = *ppa;
 }
-
+*/
 static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	uint64_t pgidx;
 
-	NVMEV_DEBUG_VERBOSE("%s: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n", __func__,
-			ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
+	NVMEV_DEBUG_VERBOSE("%s: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n", __func__, ppa->g.ch,
+			    ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
 
 	pgidx = ppa->g.ch * spp->pgs_per_ch + ppa->g.lun * spp->pgs_per_lun +
 		ppa->g.pl * spp->pgs_per_pl + ppa->g.blk * spp->pgs_per_blk + ppa->g.pg;
@@ -218,8 +223,8 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	struct line_mgmt *lm = &conv_ftl->lm;
 	struct write_pointer *wpp = __get_wp(conv_ftl, io_type);
 
-	NVMEV_DEBUG_VERBOSE("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n",
-			wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg);
+	NVMEV_DEBUG_VERBOSE("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n", wpp->ch, wpp->lun,
+			    wpp->pl, wpp->blk, wpp->pg);
 
 	check_addr(wpp->pg, spp->pgs_per_blk);
 	wpp->pg++;
@@ -277,7 +282,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	NVMEV_ASSERT(wpp->pl == 0);
 out:
 	NVMEV_DEBUG_VERBOSE("advanced wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d (curline %d)\n",
-			wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
+			    wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
 }
 
 static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type)
@@ -296,7 +301,7 @@ static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type)
 
 	return ppa;
 }
-
+/*
 static void init_maptbl(struct conv_ftl *conv_ftl)
 {
 	int i;
@@ -311,6 +316,228 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 static void remove_maptbl(struct conv_ftl *conv_ftl)
 {
 	vfree(conv_ftl->maptbl);
+}
+*/
+
+static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa);
+static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa);
+static inline bool mapped_ppa(struct ppa *ppa);
+
+static void init_dftl(struct conv_ftl *conv_ftl)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct dftl_cmt *cmt = &conv_ftl->cmt;
+	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
+	int i;
+
+	conv_ftl->num_tp = DIV_ROUND_UP(spp->tt_pgs, entries_per_tp);
+
+	conv_ftl->gtd = vmalloc(sizeof(struct ppa) * conv_ftl->num_tp);
+	for (i = 0; i < conv_ftl->num_tp; i++) {
+		conv_ftl->gtd[i].ppa = UNMAPPED_PPA;
+	}
+
+	cmt->pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
+	cmt->capacity = CMT_CAPACITY;
+	cmt->size = 0;
+	hash_init(cmt->ht);
+	INIT_LIST_HEAD(&cmt->lru_list);
+	INIT_LIST_HEAD(&cmt->free_list);
+	for (i = 0; i < CMT_CAPACITY; i++) {
+		list_add(&cmt->pool[i].lru, &cmt->free_list);
+	}
+}
+
+static void remove_dftl(struct conv_ftl *conv_ftl)
+{
+	NVMEV_INFO("CMT hits=%lld misses=%lld tp_loads=%lld tp_writebacks=%lld\n",
+		   atomic64_read(&cmt_hits), atomic64_read(&cmt_misses), atomic64_read(&tp_loads),
+		   atomic64_read(&tp_writebacks));
+
+	vfree(conv_ftl->gtd);
+	vfree(conv_ftl->cmt.pool);
+}
+
+static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_t *stime)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
+	uint32_t tp_idx = e->lpn / entries_per_tp;
+	uint32_t entry_idx = e->lpn % entries_per_tp;
+	struct ppa old_tp_ppa = conv_ftl->gtd[tp_idx];
+	struct ppa new_tp_ppa;
+	struct ppa *new_buf;
+	struct nand_cmd cmd;
+	int i;
+
+	atomic64_inc(&tp_writebacks);
+
+	/* 새 페이지 할당 */
+	new_tp_ppa = get_new_page(conv_ftl, GC_IO);
+	mark_page_valid(conv_ftl, &new_tp_ppa);
+	advance_write_pointer(conv_ftl, GC_IO);
+
+	new_buf = (struct ppa *)(conv_ftl->mapped + ppa2pgidx(conv_ftl, &new_tp_ppa) * spp->pgsz);
+
+	if (mapped_ppa(&old_tp_ppa)) {
+		/* 기존 TP 내용 복사 (read-modify-write) */
+		struct ppa *old_buf = (struct ppa *)(conv_ftl->mapped +
+						     ppa2pgidx(conv_ftl, &old_tp_ppa) * spp->pgsz);
+		memcpy(new_buf, old_buf, spp->pgsz);
+
+		/* 기존 TP read 지연 시뮬레이션 */
+		cmd = (struct nand_cmd){
+			.type = GC_IO,
+			.cmd = NAND_READ,
+			.stime = *stime,
+			.xfer_size = spp->pgsz,
+			.interleave_pci_dma = false,
+			.ppa = &old_tp_ppa,
+		};
+		*stime = ssd_advance_nand(conv_ftl->ssd, &cmd);
+
+		/* 기존 페이지 무효화 */
+		mark_page_invalid(conv_ftl, &old_tp_ppa);
+		set_rmap_ent(conv_ftl, INVALID_LPN, &old_tp_ppa);
+	} else {
+		/* 이 TP의 첫 writeback — 전체 초기화 */
+		for (i = 0; i < entries_per_tp; i++)
+			new_buf[i].ppa = UNMAPPED_PPA;
+	}
+
+	/* dirty entry 반영 */
+	new_buf[entry_idx] = e->ppa;
+
+	/* rmap에 translation page임을 기록 */
+	set_rmap_ent(conv_ftl, TRANS_LPN_BASE + tp_idx, &new_tp_ppa);
+
+	/* NAND write 지연 시뮬레이션 (wordline 단위) */
+	cmd = (struct nand_cmd){
+		.type = GC_IO,
+		.cmd = NAND_NOP,
+		.stime = *stime,
+		.interleave_pci_dma = false,
+		.ppa = &new_tp_ppa,
+	};
+	if (last_pg_in_wordline(conv_ftl, &new_tp_ppa)) {
+		cmd.cmd = NAND_WRITE;
+		cmd.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
+	}
+	*stime = ssd_advance_nand(conv_ftl->ssd, &cmd);
+
+	/* GTD 업데이트 */
+	conv_ftl->gtd[tp_idx] = new_tp_ppa;
+}
+
+static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
+{
+	struct cmt_entry *entry;
+
+	hash_for_each_possible(cmt->ht, entry, hnode, lpn) { /* hash값에 해당하는 버킷에서 */
+		if (entry->lpn == lpn) { /* 해당하는 lpn이 있으면 반환 */
+			list_move(&entry->lru, &cmt->lru_list); /* LRU -> MRU */
+			atomic64_inc(&cmt_hits);
+			return entry;
+		}
+	}
+	atomic64_inc(&cmt_misses);
+	return NULL; /* 없으면 lookup failure */
+}
+
+static struct cmt_entry *cmt_evict(struct conv_ftl *conv_ftl, uint64_t *stime)
+{
+	struct dftl_cmt *cmt = &conv_ftl->cmt;
+	struct cmt_entry *entry;
+
+	entry = list_last_entry(&cmt->lru_list, struct cmt_entry, lru);
+
+	if (entry->dirty)
+		tp_writeback(conv_ftl, entry, stime);
+
+	hash_del(&entry->hnode);
+	list_del(&entry->lru);
+	cmt->size--;
+	return entry;
+}
+
+static struct cmt_entry *cmt_insert(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa,
+				    bool dirty, uint64_t *stime)
+{
+	struct dftl_cmt *cmt = &conv_ftl->cmt;
+	struct cmt_entry *e;
+
+	if (cmt->size >= cmt->capacity) {
+		e = cmt_evict(conv_ftl, stime);
+	} else {
+		e = list_first_entry(&cmt->free_list, struct cmt_entry, lru);
+		list_del(&e->lru);
+	}
+	e->lpn = lpn;
+	e->ppa = ppa;
+	e->dirty = dirty;
+	hash_add(cmt->ht, &e->hnode, lpn);
+	list_add(&e->lru, &cmt->lru_list);
+	cmt->size++;
+	return e;
+}
+
+static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
+	uint32_t tp_idx = lpn / entries_per_tp;
+	uint32_t entry_idx = lpn % entries_per_tp;
+	struct ppa tp_ppa = conv_ftl->gtd[tp_idx];
+	struct ppa *tp_buf;
+	struct nand_cmd rd;
+
+	atomic64_inc(&tp_loads);
+	/* 이 translation page가 아직 NAND에 없으면 UNMAPPED 반환 */
+	if (!mapped_ppa(&tp_ppa)) {
+		struct ppa r;
+		r.ppa = UNMAPPED_PPA;
+		return r;
+	}
+
+	/* NAND read 지연 시뮬레이션 */
+	rd = (struct nand_cmd){
+		.type = USER_IO,
+		.cmd = NAND_READ,
+		.stime = *stime,
+		.xfer_size = spp->pgsz,
+		.interleave_pci_dma = false,
+		.ppa = &tp_ppa,
+	};
+	*stime = ssd_advance_nand(conv_ftl->ssd, &rd);
+
+	/* ns->mapped에서 해당 entry 읽기 */
+	tp_buf = (struct ppa *)(conv_ftl->mapped + ppa2pgidx(conv_ftl, &tp_ppa) * spp->pgsz);
+	return tp_buf[entry_idx];
+}
+
+static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
+{
+	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
+	if (e)
+		return e->ppa;
+
+	/* CMT miss: translation page에서 읽어와서 캐싱 */
+	struct ppa ppa = tp_load(conv_ftl, lpn, stime);
+	cmt_insert(conv_ftl, lpn, ppa, false, stime);
+	return ppa;
+}
+
+static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa, uint64_t *stime)
+{
+	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
+	if (e) {
+		e->ppa = ppa;
+		e->dirty = true;
+		return;
+	}
+
+	/* CMT miss: TP를 읽어올 필요 없이 바로 dirty로 삽입 */
+	cmt_insert(conv_ftl, lpn, ppa, true, stime);
 }
 
 static void init_rmap(struct conv_ftl *conv_ftl)
@@ -337,7 +564,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->ssd = ssd;
 
 	/* initialize maptbl */
-	init_maptbl(conv_ftl); // mapping table
+	//init_maptbl(conv_ftl); // mapping table
+	init_dftl(conv_ftl);
 
 	/* initialize rmap */
 	init_rmap(conv_ftl); // reverse mapping table (?)
@@ -361,7 +589,8 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
 	remove_lines(conv_ftl);
 	remove_rmap(conv_ftl);
-	remove_maptbl(conv_ftl);
+	//remove_maptbl(conv_ftl);
+	remove_dftl(conv_ftl);
 }
 
 static void conv_init_params(struct convparams *cpp)
@@ -409,6 +638,8 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	ns->nr_parts = nr_parts;
 	ns->ftls = (void *)conv_ftls;
 	ns->size = (uint64_t)((size * 100) / cpp.pba_pcent);
+	for (i = 0; i < nr_parts; i++)
+		conv_ftls[i].mapped = mapped_addr;
 	ns->mapped = mapped_addr;
 	/*register io command handler*/
 	ns->proc_io_cmd = conv_proc_nvme_io_cmd;
@@ -602,10 +833,10 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	struct ppa new_ppa;
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
 
-	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
+	//NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
 	new_ppa = get_new_page(conv_ftl, GC_IO);
 	/* update maptbl */
-	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+	//set_maptbl_ent(conv_ftl, lpn, &new_ppa);
 	/* update rmap */
 	set_rmap_ent(conv_ftl, lpn, &new_ppa);
 
@@ -613,6 +844,17 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 
 	/* need to advance the write pointer here */
 	advance_write_pointer(conv_ftl, GC_IO);
+
+	if (lpn >= TRANS_LPN_BASE) {
+		uint32_t tp_idx = (uint32_t)(lpn - TRANS_LPN_BASE);
+		memcpy(conv_ftl->mapped + ppa2pgidx(conv_ftl, &new_ppa) * spp->pgsz,
+		       conv_ftl->mapped + ppa2pgidx(conv_ftl, old_ppa) * spp->pgsz, spp->pgsz);
+		conv_ftl->gtd[tp_idx] = new_ppa;
+	} else {
+		uint64_t stime = 0;
+		NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
+		dftl_set_ppa(conv_ftl, lpn, new_ppa, &stime);
+	}
 
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
@@ -764,8 +1006,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 	ppa.g.blk = victim_line->id;
 	NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-		    victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
-		    conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+			    victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
+			    conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
 
 	conv_ftl->wfc.credits_to_refill = victim_line->ipc;
 
@@ -857,7 +1099,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	};
 
 	NVMEV_ASSERT(conv_ftls);
-	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn, nr_lba, end_lpn);
+	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn,
+			    nr_lba, end_lpn);
 	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
 		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n", __func__,
 			    start_lpn, spp->tt_pgs);
@@ -873,7 +1116,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
-		prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
+		//prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
+		prev_ppa = dftl_get_ppa(conv_ftl, start_lpn / nr_parts, &srd.stime);
 
 		/* normal IO read path */
 		for (lpn = start_lpn; lpn <= end_lpn; lpn += nr_parts) {
@@ -881,12 +1125,15 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			struct ppa cur_ppa;
 
 			local_lpn = lpn / nr_parts;
-			cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
+			//cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
+			cur_ppa = dftl_get_ppa(conv_ftl, local_lpn, &srd.stime);
+
 			if (!mapped_ppa(&cur_ppa) || !valid_ppa(conv_ftl, &cur_ppa)) {
-				NVMEV_DEBUG_VERBOSE("lpn 0x%llx not mapped to valid ppa\n", local_lpn);
+				NVMEV_DEBUG_VERBOSE("lpn 0x%llx not mapped to valid ppa\n",
+						    local_lpn);
 				NVMEV_DEBUG_VERBOSE("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d\n",
-					    cur_ppa.g.ch, cur_ppa.g.lun, cur_ppa.g.blk,
-					    cur_ppa.g.pl, cur_ppa.g.pg);
+						    cur_ppa.g.ch, cur_ppa.g.lun, cur_ppa.g.blk,
+						    cur_ppa.g.pl, cur_ppa.g.pg);
 				continue;
 			}
 
@@ -951,10 +1198,11 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
 	};
 
-	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn, nr_lba, end_lpn);
+	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn,
+			    nr_lba, end_lpn);
 	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
-		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n",
-				__func__, start_lpn, spp->tt_pgs);
+		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n", __func__,
+			    start_lpn, spp->tt_pgs);
 		return false;
 	}
 
@@ -975,8 +1223,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
-		ppa = get_maptbl_ent(
-			conv_ftl, local_lpn); // Check whether the given LPN has been written before
+		//ppa = get_maptbl_ent(
+		//	conv_ftl, local_lpn); // Check whether the given LPN has been written before
+		ppa = dftl_get_ppa(conv_ftl, local_lpn, &swr.stime);
 		if (mapped_ppa(&ppa)) {
 			/* update old page information first */
 			mark_page_invalid(conv_ftl, &ppa);
@@ -987,7 +1236,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		/* new write */
 		ppa = get_new_page(conv_ftl, USER_IO);
 		/* update maptbl */
-		set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+		//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+		dftl_set_ppa(conv_ftl, local_lpn, ppa, &swr.stime);
 		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
 		/* update rmap */
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
@@ -1063,7 +1313,7 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		break;
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,
-				nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+			    nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
 		break;
 	}
 
