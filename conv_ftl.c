@@ -368,6 +368,7 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 	struct ppa new_tp_ppa;
 	struct ppa *new_buf;
 	struct nand_cmd cmd;
+	uint64_t nsecs_completed, nsecs_latest = *stime;
 	int i;
 
 	atomic64_inc(&tp_writebacks);
@@ -389,12 +390,13 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 		cmd = (struct nand_cmd){
 			.type = GC_IO,
 			.cmd = NAND_READ,
-			.stime = *stime,
+			.stime = nsecs_latest,
 			.xfer_size = spp->pgsz,
 			.interleave_pci_dma = false,
 			.ppa = &old_tp_ppa,
 		};
-		*stime = ssd_advance_nand(conv_ftl->ssd, &cmd);
+		nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
+		nsecs_latest = max(nsecs_completed, nsecs_latest);
 
 		/* 기존 페이지 무효화 */
 		mark_page_invalid(conv_ftl, &old_tp_ppa);
@@ -415,7 +417,7 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 	cmd = (struct nand_cmd){
 		.type = GC_IO,
 		.cmd = NAND_NOP,
-		.stime = *stime,
+		.stime = nsecs_latest,
 		.interleave_pci_dma = false,
 		.ppa = &new_tp_ppa,
 	};
@@ -423,10 +425,13 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 		cmd.cmd = NAND_WRITE;
 		cmd.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
 	}
-	*stime = ssd_advance_nand(conv_ftl->ssd, &cmd);
+	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
+	nsecs_latest = max(nsecs_completed, nsecs_latest);
 
 	/* GTD 업데이트 */
 	conv_ftl->gtd[tp_idx] = new_tp_ppa;
+
+	*stime = nsecs_latest;
 }
 
 static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
@@ -490,6 +495,7 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 	struct ppa tp_ppa = conv_ftl->gtd[tp_idx];
 	struct ppa *tp_buf;
 	struct nand_cmd rd;
+	uint64_t nsecs_completed, nsecs_latest = *stime;
 
 	atomic64_inc(&tp_loads);
 	/* 이 translation page가 아직 NAND에 없으면 UNMAPPED 반환 */
@@ -503,12 +509,14 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 	rd = (struct nand_cmd){
 		.type = USER_IO,
 		.cmd = NAND_READ,
-		.stime = *stime,
+		.stime = nsecs_latest,
 		.xfer_size = spp->pgsz,
 		.interleave_pci_dma = false,
 		.ppa = &tp_ppa,
 	};
-	*stime = ssd_advance_nand(conv_ftl->ssd, &rd);
+	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &rd);
+	nsecs_latest = max(nsecs_completed, nsecs_latest);
+	*stime = nsecs_latest;
 
 	/* ns->mapped에서 해당 entry 읽기 */
 	tp_buf = (struct ppa *)(conv_ftl->mapped + ppa2pgidx(conv_ftl, &tp_ppa) * spp->pgsz);
