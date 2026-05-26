@@ -171,3 +171,5 @@ cmt_insert() (CMT 꽉 참)
 |------|----------|
 | `conv_ftl.h` | CMT/GTD 자료구조 추가, `maptbl` → `gtd`/`cmt`/`num_tp`/`mapped`로 교체 |
 | `conv_ftl.c` | D-FTL 함수 전체 추가, read/write/GC 경로에서 `get/set_maptbl_ent` → `dftl_get/set_ppa` 교체 |
+
+## Validation (TODO)
