@@ -86,6 +86,7 @@ struct conv_ftl {
 	//struct ppa *maptbl; /* page level mapping table */
 
 	struct ppa *gtd;
+	struct ppa *tp_data; /* TP page content, indexed by [tp_idx * entries_per_tp + entry_idx] */
 	struct dftl_cmt cmt;
 	uint32_t num_tp;
 	void *mapped;

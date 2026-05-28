@@ -337,6 +337,11 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 		conv_ftl->gtd[i].ppa = UNMAPPED_PPA;
 	}
 
+	conv_ftl->tp_data = vmalloc(sizeof(struct ppa) * conv_ftl->num_tp * entries_per_tp);
+	for (i = 0; i < conv_ftl->num_tp * entries_per_tp; i++) {
+		conv_ftl->tp_data[i].ppa = UNMAPPED_PPA;
+	}
+
 	cmt->pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
 	cmt->capacity = CMT_CAPACITY;
 	cmt->size = 0;
@@ -355,6 +360,7 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 		   atomic64_read(&tp_writebacks));
 
 	vfree(conv_ftl->gtd);
+	vfree(conv_ftl->tp_data);
 	vfree(conv_ftl->cmt.pool);
 }
 
@@ -366,10 +372,8 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 	uint32_t entry_idx = e->lpn % entries_per_tp;
 	struct ppa old_tp_ppa = conv_ftl->gtd[tp_idx];
 	struct ppa new_tp_ppa;
-	struct ppa *new_buf;
 	struct nand_cmd cmd;
 	uint64_t nsecs_completed, nsecs_latest = *stime;
-	int i;
 
 	atomic64_inc(&tp_writebacks);
 
@@ -378,14 +382,7 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 	mark_page_valid(conv_ftl, &new_tp_ppa);
 	advance_write_pointer(conv_ftl, GC_IO);
 
-	new_buf = (struct ppa *)(conv_ftl->mapped + ppa2pgidx(conv_ftl, &new_tp_ppa) * spp->pgsz);
-
 	if (mapped_ppa(&old_tp_ppa)) {
-		/* 기존 TP 내용 복사 (read-modify-write) */
-		struct ppa *old_buf = (struct ppa *)(conv_ftl->mapped +
-						     ppa2pgidx(conv_ftl, &old_tp_ppa) * spp->pgsz);
-		memcpy(new_buf, old_buf, spp->pgsz);
-
 		/* 기존 TP read 지연 시뮬레이션 */
 		cmd = (struct nand_cmd){
 			.type = GC_IO,
@@ -401,14 +398,10 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 		/* 기존 페이지 무효화 */
 		mark_page_invalid(conv_ftl, &old_tp_ppa);
 		set_rmap_ent(conv_ftl, INVALID_LPN, &old_tp_ppa);
-	} else {
-		/* 이 TP의 첫 writeback — 전체 초기화 */
-		for (i = 0; i < entries_per_tp; i++)
-			new_buf[i].ppa = UNMAPPED_PPA;
 	}
 
-	/* dirty entry 반영 */
-	new_buf[entry_idx] = e->ppa;
+	/* dirty entry를 tp_data에 반영 (tp_data는 tp_idx로 직접 인덱싱) */
+	conv_ftl->tp_data[tp_idx * entries_per_tp + entry_idx] = e->ppa;
 
 	/* rmap에 translation page임을 기록 */
 	set_rmap_ent(conv_ftl, TRANS_LPN_BASE + tp_idx, &new_tp_ppa);
@@ -493,7 +486,6 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 	uint32_t tp_idx = lpn / entries_per_tp;
 	uint32_t entry_idx = lpn % entries_per_tp;
 	struct ppa tp_ppa = conv_ftl->gtd[tp_idx];
-	struct ppa *tp_buf;
 	struct nand_cmd rd;
 	uint64_t nsecs_completed, nsecs_latest = *stime;
 
@@ -518,9 +510,8 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 	nsecs_latest = max(nsecs_completed, nsecs_latest);
 	*stime = nsecs_latest;
 
-	/* ns->mapped에서 해당 entry 읽기 */
-	tp_buf = (struct ppa *)(conv_ftl->mapped + ppa2pgidx(conv_ftl, &tp_ppa) * spp->pgsz);
-	return tp_buf[entry_idx];
+	/* tp_data에서 해당 entry 읽기 (tp_idx로 직접 인덱싱) */
+	return conv_ftl->tp_data[tp_idx * entries_per_tp + entry_idx];
 }
 
 static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
