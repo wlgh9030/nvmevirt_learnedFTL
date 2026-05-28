@@ -378,14 +378,14 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 	atomic64_inc(&tp_writebacks);
 
 	/* 새 페이지 할당 */
-	new_tp_ppa = get_new_page(conv_ftl, GC_IO);
+	new_tp_ppa = get_new_page(conv_ftl, USER_IO);
 	mark_page_valid(conv_ftl, &new_tp_ppa);
-	advance_write_pointer(conv_ftl, GC_IO);
+	advance_write_pointer(conv_ftl, USER_IO);
 
 	if (mapped_ppa(&old_tp_ppa)) {
 		/* 기존 TP read 지연 시뮬레이션 */
 		cmd = (struct nand_cmd){
-			.type = GC_IO,
+			.type = USER_IO,
 			.cmd = NAND_READ,
 			.stime = nsecs_latest,
 			.xfer_size = spp->pgsz,
@@ -408,7 +408,7 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 
 	/* NAND write 지연 시뮬레이션 (wordline 단위) */
 	cmd = (struct nand_cmd){
-		.type = GC_IO,
+		.type = USER_IO,
 		.cmd = NAND_NOP,
 		.stime = nsecs_latest,
 		.interleave_pci_dma = false,
@@ -489,13 +489,13 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 	struct nand_cmd rd;
 	uint64_t nsecs_completed, nsecs_latest = *stime;
 
-	atomic64_inc(&tp_loads);
 	/* 이 translation page가 아직 NAND에 없으면 UNMAPPED 반환 */
 	if (!mapped_ppa(&tp_ppa)) {
 		struct ppa r;
 		r.ppa = UNMAPPED_PPA;
 		return r;
 	}
+	atomic64_inc(&tp_loads);
 
 	/* NAND read 지연 시뮬레이션 */
 	rd = (struct nand_cmd){
@@ -517,11 +517,13 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
 {
 	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
+	struct ppa ppa;
+
 	if (e)
 		return e->ppa;
 
 	/* CMT miss: translation page에서 읽어와서 캐싱 */
-	struct ppa ppa = tp_load(conv_ftl, lpn, stime);
+	ppa = tp_load(conv_ftl, lpn, stime);
 	cmt_insert(conv_ftl, lpn, ppa, false, stime);
 	return ppa;
 }
@@ -846,8 +848,8 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 
 	if (lpn >= TRANS_LPN_BASE) {
 		uint32_t tp_idx = (uint32_t)(lpn - TRANS_LPN_BASE);
-		memcpy(conv_ftl->mapped + ppa2pgidx(conv_ftl, &new_ppa) * spp->pgsz,
-		       conv_ftl->mapped + ppa2pgidx(conv_ftl, old_ppa) * spp->pgsz, spp->pgsz);
+		//memcpy(conv_ftl->mapped + ppa2pgidx(conv_ftl, &new_ppa) * spp->pgsz,
+		//       conv_ftl->mapped + ppa2pgidx(conv_ftl, old_ppa) * spp->pgsz, spp->pgsz);
 		conv_ftl->gtd[tp_idx] = new_ppa;
 	} else {
 		uint64_t stime = 0;

@@ -78,9 +78,9 @@ void *mapped;          // NAND 메모리 매핑 영역 포인터(for Virt)
 ### 5. 설정값 — `conv_ftl.h:13-16`
 
 ```c
-#define CMT_CAPACITY   1024                      // CMT 최대 entry 수
-#define CMT_HASH_BITS  10                        // 해시 버킷 수 = 2^10
-#define CMT_HASH_SIZE  (1 << CMT_HASH_BITS)      // = 1024
+#define CMT_CAPACITY   64                        // CMT 최대 entry 수
+#define CMT_HASH_BITS  6                         // 해시 버킷 수 = 2^6
+#define CMT_HASH_SIZE  (1 << CMT_HASH_BITS)      // = 64
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL<<32)) // TP용 특수 LPN 기준값
 ```
 
@@ -172,4 +172,68 @@ cmt_insert() (CMT 꽉 참)
 | `conv_ftl.h` | CMT/GTD 자료구조 추가, `maptbl` → `gtd`/`cmt`/`num_tp`/`mapped`로 교체 |
 | `conv_ftl.c` | D-FTL 함수 전체 추가, read/write/GC 경로에서 `get/set_maptbl_ent` → `dftl_get/set_ppa` 교체 |
 
-## Validation (TODO)
+## Validation
+
+공통 조건: iodepth=1 (latency 측정 목적), bs=4k, direct I/O.
+
+---
+
+### 실험 1: convFTL 대비 D-FTL overhead 측정
+
+CMT_CAPACITY=64로 고정하고, D-FTL과 convFTL(full in-memory mapping)을 비교한다.  
+Working set이 CMT보다 훨씬 클 때 D-FTL overhead를 측정한다.
+
+```bash
+# Sequential write 1 GB → Random read 512 MB
+sudo fio --name=write --filename=/dev/nvme0n1 --rw=write     --bs=4k --iodepth=1 --size=1G   --direct=1
+sudo fio --name=read  --filename=/dev/nvme0n1 --rw=randread  --bs=4k --iodepth=1 --size=512M --direct=1
+```
+
+| 항목              |     D-FTL |   convFTL |         overhead |
+|-------------------|----------:|----------:|-----------------:|
+| Write avg latency |  29.10 µs |  11.56 µs | **2.52x** |
+| Write IOPS        |     34.2k |     84.1k | **2.46x 낮음** |
+| Read avg latency  |  96.57 µs |  62.01 µs | **1.56x** |
+| Read IOPS         |     10.3k |     16.0k | **1.55x 낮음** |
+
+**CMT 통계 (D-FTL)**
+
+```
+CMT hits=393,731 (50%) / misses=393,823 (50%) / tp_loads=393,823 / tp_writebacks=262,144
+```
+
+- **Read 1.56x**: miss 50% → 절반의 read에서 TP NAND read 추가 (기대 overhead 1.5x ≈ 실측 1.56x)
+- **Write 2.52x**: miss eviction의 66.5%가 dirty → tp_writeback(NAND read-modify-write) 추가
+
+---
+
+### 실험 2: CMT Capacity Sweep
+
+Working set을 CMT 크기와 맞춰 CMT capacity 효과를 측정한다.
+
+```bash
+# Write 4 MB → Random read 4 MB (working set = 1024 LPN)
+sudo fio --name=write --filename=/dev/nvme0n1 --rw=write     --bs=4k --iodepth=1 --size=4M --direct=1
+sudo fio --name=read  --filename=/dev/nvme0n1 --rw=randread  --bs=4k --iodepth=1 --size=4M --direct=1
+```
+
+| 항목              |   CMT=64 |  CMT=1024 |           비고 |
+|-------------------|----------:|----------:|---------------:|
+| avg latency       |  98.04 µs |  62.45 µs | **36% 감소** |
+| IOPS              |     10.1k |     15.8k | **1.56x 증가** |
+| 99.9th latency    |    652 µs |    133 µs | tail latency 개선 |
+| max latency       |    823 µs |    171 µs | |
+
+- **CMT=64**: write 중 960회 eviction → tp_writeback으로 GTD 채워짐 → read에서 CMT miss 시 TP NAND read 발생 → ~98 µs
+- **CMT=1024**: working set(1024 LPN) = CMT 크기 → eviction 없음 → GTD 미사용, CMT에서 직접 hit → ~62 µs ≈ convFTL 동등
+- working set이 CMT에 완전히 들어오면 D-FTL은 **translation NAND I/O 없이 convFTL과 동등한 성능**을 낸다.
+
+## 추후 검증 계획
+
+1. Additional CMT_CAPACITY sweep
+CMT 크기를 64 → 128 → 256 → 512 → 1024로 변화시키며 hit rate / latency 측정.
+
+2. Sequential vs Random 패턴 비교
+
+3. Read-heavy vs Write-heavy 비율 변화
+read:write를 9:1, 7:3, 5:5, 3:7로 바꿔가며 측정.
