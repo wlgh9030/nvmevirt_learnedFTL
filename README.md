@@ -228,12 +228,71 @@ sudo fio --name=read  --filename=/dev/nvme0n1 --rw=randread  --bs=4k --iodepth=1
 - **CMT=1024**: working set(1024 LPN) = CMT 크기 → eviction 없음 → GTD 미사용, CMT에서 직접 hit → ~62 µs ≈ convFTL 동등
 - working set이 CMT에 완전히 들어오면 D-FTL은 **translation NAND I/O 없이 convFTL과 동등한 성능**을 낸다.
 
-## 추후 검증 계획
+### 실험 3: CMT capacity sweep
 
-1. Additional CMT_CAPACITY sweep
-CMT 크기를 64 → 128 → 256 → 512 → 1024로 변화시키며 hit rate / latency 측정.
+`CMT_CAPACITY`를 64 → 1024로 재컴파일하며 random read 성능을 측정한다.
+실효 working set은 `nr_parts`로 분할되므로 per-instance 기준 ~512 LPN 수준이다.
 
-2. Sequential vs Random 패턴 비교
+```bash
+# 각 CMT 빌드마다: write precondition → random read
+sudo fio --name=precond --filename=/dev/nvme0n1 --rw=write    --bs=4k --iodepth=1 --size=4M --direct=1
+sudo fio --name=sweep   --filename=/dev/nvme0n1 --rw=randread --bs=4k --iodepth=1 --size=4M --direct=1
+```
 
-3. Read-heavy vs Write-heavy 비율 변화
-read:write를 9:1, 7:3, 5:5, 3:7로 바꿔가며 측정.
+|  CMT |   hit rate | tp_loads | tp_writebacks |  rd avg | rd IOPS |
+|-----:|-----------:|---------:|--------------:|--------:|--------:|
+|   64 |       8.4% |     1906 |          1024 | 95.3 µs |   10.4k |
+|  128 |      18.3% |     1565 |          1024 | 110.9 µs¹ |  8.9k |
+|  256 |      39.0% |      462 |           457 | 86.3 µs |   11.5k |
+|  512 | **59.8%** |    **0** |         **0** | **62.3 µs** | **15.8k** |
+| 1024 |      59.8% |        0 |             0 | 69.3 µs¹ |  14.2k |
+
+¹ latency outlier(측정 노이즈). hit rate·tp_loads가 단조적이므로 주지표로 사용.
+
+- CMT가 working set을 모두 담는 **512 지점에서 translation NAND I/O가 0**으로 사라지며 convFTL 동등 성능(62 µs)에 도달.
+- 그 이하에서는 eviction → tp_writeback, miss 시 tp_load가 발생하여 latency 증가.
+
+---
+
+### 실험 4: Sequential vs Random 패턴
+
+Working set(64 MB = 16384 LPN)이 CMT를 크게 초과하는 조건에서 패턴 영향을 본다.
+
+```bash
+sudo fio --name=fill   --filename=/dev/nvme0n1 --rw=write     --bs=4k --iodepth=1 --size=64M --direct=1
+sudo fio --name=seq_rd --filename=/dev/nvme0n1 --rw=read      --bs=4k --iodepth=1 --size=64M --direct=1
+sudo fio --name=rnd_rd --filename=/dev/nvme0n1 --rw=randread  --bs=4k --iodepth=1 --size=64M --direct=1
+sudo fio --name=seq_wr --filename=/dev/nvme0n1 --rw=write     --bs=4k --iodepth=1 --size=64M --direct=1
+sudo fio --name=rnd_wr --filename=/dev/nvme0n1 --rw=randwrite --bs=4k --iodepth=1 --size=64M --direct=1
+```
+
+| 패턴       |   avg | 99.9th |  IOPS |
+|------------|------:|-------:|------:|
+| seq read   | 95.3 µs | 362.5 µs | 10.5k |
+| rand read  | 95.3 µs | 301.1 µs | 10.5k |
+| seq write  | 26.3 µs |  43.3 µs | 37.4k |
+| rand write | 22.1 µs |  32.4 µs | 44.5k |
+
+- read는 seq/rand가 **거의 동일** (hit rate 0.7%, tp_loads 80210). working set이 CMT를 크게 초과해 접근 패턴보다 **CMT 용량 부족이 지배적**.
+
+---
+
+### 실험 5: Read-heavy vs Write-heavy 비율
+
+`rwmixread`를 90/70/50/30으로 바꿔 read:write를 9:1 ~ 3:7로 변화시킨다 (64 MB fill 선행).
+
+```bash
+sudo fio --name=fill --filename=/dev/nvme0n1 --rw=write --bs=4k --iodepth=1 --size=64M --direct=1
+sudo fio --name=mix  --filename=/dev/nvme0n1 --rw=randrw --rwmixread=90 \
+         --bs=4k --iodepth=1 --size=64M --direct=1   # 90 → 70 → 50 → 30
+```
+
+| read:write | rd hit rate | tp_writebacks |  rd avg | rd IOPS | wr IOPS |
+|------------|------------:|--------------:|--------:|--------:|--------:|
+| 9:1 | 3.8% | 17576 | 117.8 µs |  8.4k |  0.9k |
+| 7:3 | 3.8% | 20006 | 131.5 µs |  7.3k |  3.1k |
+| 5:5 | 3.8% | 22403 | 149.1 µs |  6.1k |  6.2k |
+| 3:7 | 3.8% | 24819 | 182.5 µs |  4.7k | 11.0k |
+
+- write 비율↑ → **dirty eviction(tp_writeback) 증가**(17.6k → 24.8k) → read latency 117 → 182 µs로 악화. write가 translation writeback/GC를 유발해 read를 간섭.
+- read hit rate는 동일 fill·working set이라 mix 비율과 무관하게 일정(3.8%).

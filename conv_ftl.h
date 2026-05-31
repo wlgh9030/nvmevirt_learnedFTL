@@ -10,8 +10,8 @@
 #include "ssd_config.h"
 #include "ssd.h"
 
-#define CMT_CAPACITY 64
-#define CMT_HASH_BITS 6
+#define CMT_CAPACITY 512
+#define CMT_HASH_BITS 9
 #define CMT_HASH_SIZE (1 << CMT_HASH_BITS)
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
 
