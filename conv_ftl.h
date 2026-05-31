@@ -11,25 +11,44 @@
 #include "ssd.h"
 
 #define CMT_CAPACITY 64
-#define CMT_HASH_BITS 6
-#define CMT_HASH_SIZE (1 << CMT_HASH_BITS)
+#define CMT_ENTRY_HASH_BITS 6
+#define CMT_ENTRY_HASH_SIZE (1 << CMT_ENTRY_HASH_BITS)
+#define CMT_NODE_HASH_BITS 6
+#define CMT_NODE_HASH_SIZE (1 << CMT_NODE_HASH_BITS)
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
+
+struct tp_node;
 
 struct cmt_entry {
 	uint64_t lpn;
 	struct ppa ppa;
 	bool dirty;
-	struct list_head lru;
+	struct tp_node *parent;
+	struct list_head sibling; /* parent->entries when in use, entry_free_list when free */
+	struct hlist_node hnode;
+};
+
+struct tp_node {
+	uint32_t tp_idx;
+	uint32_t entry_count;
+	uint32_t dirty_count;
+	struct list_head entries;
+	struct list_head lru; /* node_lru when in use, node_free_list when free */
 	struct hlist_node hnode;
 };
 
 struct dftl_cmt {
-	struct cmt_entry *pool;
-	struct hlist_head ht[CMT_HASH_SIZE];
-	struct list_head lru_list;
-	struct list_head free_list;
-	uint32_t size;
-	uint32_t capacity;
+	struct cmt_entry *entry_pool;
+	struct tp_node *node_pool;
+	struct hlist_head entry_ht[CMT_ENTRY_HASH_SIZE];
+	struct hlist_head node_ht[CMT_NODE_HASH_SIZE];
+	struct list_head node_lru;
+	struct list_head entry_free_list;
+	struct list_head node_free_list;
+	uint32_t entry_size;
+	uint32_t entry_capacity;
+	uint32_t node_size;
+	uint32_t node_capacity;
 };
 
 struct convparams {
@@ -88,7 +107,7 @@ struct conv_ftl {
 	struct ppa *gtd;
 	struct dftl_cmt cmt;
 	uint32_t num_tp;
-	void *mapped;
+	void *tp_map; /* translation page content store, indexed by tp_idx */
 
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
 	struct write_pointer wp;

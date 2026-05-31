@@ -11,6 +11,8 @@ static atomic64_t cmt_hits = ATOMIC64_INIT(0);
 static atomic64_t cmt_misses = ATOMIC64_INIT(0);
 static atomic64_t tp_loads = ATOMIC64_INIT(0);
 static atomic64_t tp_writebacks = ATOMIC64_INIT(0);
+static atomic64_t cmt_node_evicts = ATOMIC64_INIT(0);
+static atomic64_t tp_writeback_entries_total = ATOMIC64_INIT(0);
 
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -323,70 +325,103 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static inline bool mapped_ppa(struct ppa *ppa);
 
+static inline uint32_t entries_per_tp(struct conv_ftl *conv_ftl)
+{
+	return conv_ftl->ssd->sp.pgsz / sizeof(struct ppa);
+}
+
 static void init_dftl(struct conv_ftl *conv_ftl)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
-	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 	int i;
 
-	conv_ftl->num_tp = DIV_ROUND_UP(spp->tt_pgs, entries_per_tp);
+	conv_ftl->num_tp = DIV_ROUND_UP(spp->tt_pgs, entries_per_tp(conv_ftl));
 
 	conv_ftl->gtd = vmalloc(sizeof(struct ppa) * conv_ftl->num_tp);
 	for (i = 0; i < conv_ftl->num_tp; i++) {
 		conv_ftl->gtd[i].ppa = UNMAPPED_PPA;
 	}
 
-	cmt->pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
-	cmt->capacity = CMT_CAPACITY;
-	cmt->size = 0;
-	hash_init(cmt->ht);
-	INIT_LIST_HEAD(&cmt->lru_list);
-	INIT_LIST_HEAD(&cmt->free_list);
+	/* TP content store: one page per TP, indexed by tp_idx, init UNMAPPED */
+	conv_ftl->tp_map = vmalloc((size_t)conv_ftl->num_tp * spp->pgsz);
+	{
+		struct ppa *p = (struct ppa *)conv_ftl->tp_map;
+		uint64_t n = (uint64_t)conv_ftl->num_tp * entries_per_tp(conv_ftl);
+		uint64_t k;
+		for (k = 0; k < n; k++)
+			p[k].ppa = UNMAPPED_PPA;
+	}
+
+	cmt->entry_pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
+	cmt->node_pool = vmalloc(sizeof(struct tp_node) * CMT_CAPACITY);
+	cmt->entry_capacity = CMT_CAPACITY;
+	cmt->node_capacity = CMT_CAPACITY;
+	cmt->entry_size = 0;
+	cmt->node_size = 0;
+	hash_init(cmt->entry_ht);
+	hash_init(cmt->node_ht);
+	INIT_LIST_HEAD(&cmt->node_lru);
+	INIT_LIST_HEAD(&cmt->entry_free_list);
+	INIT_LIST_HEAD(&cmt->node_free_list);
 	for (i = 0; i < CMT_CAPACITY; i++) {
-		list_add(&cmt->pool[i].lru, &cmt->free_list);
+		list_add(&cmt->entry_pool[i].sibling, &cmt->entry_free_list);
+		list_add(&cmt->node_pool[i].lru, &cmt->node_free_list);
 	}
 }
 
 static void remove_dftl(struct conv_ftl *conv_ftl)
 {
-	NVMEV_INFO("CMT hits=%lld misses=%lld tp_loads=%lld tp_writebacks=%lld\n",
+	uint64_t wb = atomic64_read(&tp_writebacks);
+	uint64_t wb_entries = atomic64_read(&tp_writeback_entries_total);
+
+	NVMEV_INFO("CMT hits=%lld misses=%lld tp_loads=%lld tp_writebacks=%lld "
+		   "node_evicts=%lld avg_batch=%lld.%02lld\n",
 		   atomic64_read(&cmt_hits), atomic64_read(&cmt_misses), atomic64_read(&tp_loads),
-		   atomic64_read(&tp_writebacks));
+		   wb, atomic64_read(&cmt_node_evicts), wb ? wb_entries / wb : 0,
+		   wb ? (wb_entries * 100 / wb) % 100 : 0);
 
 	vfree(conv_ftl->gtd);
-	vfree(conv_ftl->cmt.pool);
+	vfree(conv_ftl->tp_map);
+	vfree(conv_ftl->cmt.entry_pool);
+	vfree(conv_ftl->cmt.node_pool);
 }
 
-static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_t *stime)
+static struct tp_node *node_lookup(struct dftl_cmt *cmt, uint32_t tp_idx)
+{
+	struct tp_node *node;
+
+	hash_for_each_possible(cmt->node_ht, node, hnode, tp_idx) {
+		if (node->tp_idx == tp_idx)
+			return node;
+	}
+	return NULL;
+}
+
+static void tp_writeback_node(struct conv_ftl *conv_ftl, struct tp_node *node, uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
-	uint32_t tp_idx = e->lpn / entries_per_tp;
-	uint32_t entry_idx = e->lpn % entries_per_tp;
-	struct ppa old_tp_ppa = conv_ftl->gtd[tp_idx];
+	uint32_t ents_per_tp = entries_per_tp(conv_ftl);
+	struct ppa old_tp_ppa = conv_ftl->gtd[node->tp_idx];
 	struct ppa new_tp_ppa;
-	struct ppa *new_buf;
+	struct ppa *tp_buf;
+	struct cmt_entry *e;
 	struct nand_cmd cmd;
 	uint64_t nsecs_completed, nsecs_latest = *stime;
-	int i;
 
 	atomic64_inc(&tp_writebacks);
+	atomic64_add(node->dirty_count, &tp_writeback_entries_total);
 
-	/* 새 페이지 할당 */
+	/* 새 페이지 할당 (NAND 점유 시뮬레이션) */
 	new_tp_ppa = get_new_page(conv_ftl, GC_IO);
 	mark_page_valid(conv_ftl, &new_tp_ppa);
 	advance_write_pointer(conv_ftl, GC_IO);
 
-	new_buf = (struct ppa *)(conv_ftl->mapped + ppa2pgidx(conv_ftl, &new_tp_ppa) * spp->pgsz);
+	/* TP 내용물은 물리 위치와 무관하게 tp_idx 슬롯에 고정 보관 */
+	tp_buf = (struct ppa *)(conv_ftl->tp_map + (size_t)node->tp_idx * spp->pgsz);
 
 	if (mapped_ppa(&old_tp_ppa)) {
-		/* 기존 TP 내용 복사 (read-modify-write) */
-		struct ppa *old_buf = (struct ppa *)(conv_ftl->mapped +
-						     ppa2pgidx(conv_ftl, &old_tp_ppa) * spp->pgsz);
-		memcpy(new_buf, old_buf, spp->pgsz);
-
-		/* 기존 TP read 지연 시뮬레이션 */
+		/* 기존 TP read 지연 시뮬레이션 (read-modify-write) */
 		cmd = (struct nand_cmd){
 			.type = GC_IO,
 			.cmd = NAND_READ,
@@ -401,17 +436,19 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 		/* 기존 페이지 무효화 */
 		mark_page_invalid(conv_ftl, &old_tp_ppa);
 		set_rmap_ent(conv_ftl, INVALID_LPN, &old_tp_ppa);
-	} else {
-		/* 이 TP의 첫 writeback — 전체 초기화 */
-		for (i = 0; i < entries_per_tp; i++)
-			new_buf[i].ppa = UNMAPPED_PPA;
 	}
 
-	/* dirty entry 반영 */
-	new_buf[entry_idx] = e->ppa;
+	/* batch patch: 노드의 모든 dirty entry를 한 번에 반영 */
+	list_for_each_entry(e, &node->entries, sibling) {
+		if (e->dirty) {
+			tp_buf[e->lpn % ents_per_tp] = e->ppa;
+			e->dirty = false;
+		}
+	}
+	node->dirty_count = 0;
 
 	/* rmap에 translation page임을 기록 */
-	set_rmap_ent(conv_ftl, TRANS_LPN_BASE + tp_idx, &new_tp_ppa);
+	set_rmap_ent(conv_ftl, TRANS_LPN_BASE + node->tp_idx, &new_tp_ppa);
 
 	/* NAND write 지연 시뮬레이션 (wordline 단위) */
 	cmd = (struct nand_cmd){
@@ -429,7 +466,7 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint64_
 	nsecs_latest = max(nsecs_completed, nsecs_latest);
 
 	/* GTD 업데이트 */
-	conv_ftl->gtd[tp_idx] = new_tp_ppa;
+	conv_ftl->gtd[node->tp_idx] = new_tp_ppa;
 
 	*stime = nsecs_latest;
 }
@@ -438,9 +475,9 @@ static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
 {
 	struct cmt_entry *entry;
 
-	hash_for_each_possible(cmt->ht, entry, hnode, lpn) { /* hash값에 해당하는 버킷에서 */
+	hash_for_each_possible(cmt->entry_ht, entry, hnode, lpn) { /* hash값에 해당하는 버킷에서 */
 		if (entry->lpn == lpn) { /* 해당하는 lpn이 있으면 반환 */
-			list_move(&entry->lru, &cmt->lru_list); /* LRU -> MRU */
+			list_move(&entry->parent->lru, &cmt->node_lru); /* parent TPnode -> MRU */
 			atomic64_inc(&cmt_hits);
 			return entry;
 		}
@@ -449,49 +486,87 @@ static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
 	return NULL; /* 없으면 lookup failure */
 }
 
-static struct cmt_entry *cmt_evict(struct conv_ftl *conv_ftl, uint64_t *stime)
+/* LRU tail TPnode를 통째로 evict한다. dirty가 있으면 1회 batch writeback. */
+static void cmt_evict_node(struct conv_ftl *conv_ftl, uint64_t *stime)
 {
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
-	struct cmt_entry *entry;
+	struct tp_node *node;
+	struct cmt_entry *e, *tmp;
 
-	entry = list_last_entry(&cmt->lru_list, struct cmt_entry, lru);
+	node = list_last_entry(&cmt->node_lru, struct tp_node, lru);
 
-	if (entry->dirty)
-		tp_writeback(conv_ftl, entry, stime);
+	if (node->dirty_count > 0)
+		tp_writeback_node(conv_ftl, node, stime);
 
-	hash_del(&entry->hnode);
-	list_del(&entry->lru);
-	cmt->size--;
-	return entry;
+	list_for_each_entry_safe(e, tmp, &node->entries, sibling) {
+		hash_del(&e->hnode);
+		list_del(&e->sibling);
+		list_add(&e->sibling, &cmt->entry_free_list);
+		cmt->entry_size--;
+	}
+
+	hash_del(&node->hnode);
+	list_del(&node->lru);
+	list_add(&node->lru, &cmt->node_free_list);
+	cmt->node_size--;
+	atomic64_inc(&cmt_node_evicts);
 }
 
 static struct cmt_entry *cmt_insert(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa,
 				    bool dirty, uint64_t *stime)
 {
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
+	uint32_t tp_idx = lpn / entries_per_tp(conv_ftl);
+	struct tp_node *node;
 	struct cmt_entry *e;
 
-	if (cmt->size >= cmt->capacity) {
-		e = cmt_evict(conv_ftl, stime);
-	} else {
-		e = list_first_entry(&cmt->free_list, struct cmt_entry, lru);
-		list_del(&e->lru);
+retry:
+	node = node_lookup(cmt, tp_idx);
+	/* 기존 노드면 evict 대상에서 보호하기 위해 MRU로 이동 */
+	if (node)
+		list_move(&node->lru, &cmt->node_lru);
+
+	/* entry 풀이 가득 차면 LRU tail 노드 evict.
+	 * node_size <= entry_size 이므로 entry 검사가 node 풀 검사도 포괄.
+	 * 노드가 1개뿐인 degenerate 케이스에선 우리 노드가 evict될 수 있으므로 retry. */
+	if (cmt->entry_size >= cmt->entry_capacity) {
+		cmt_evict_node(conv_ftl, stime);
+		goto retry;
 	}
+
+	if (!node) {
+		node = list_first_entry(&cmt->node_free_list, struct tp_node, lru);
+		list_del(&node->lru);
+		node->tp_idx = tp_idx;
+		node->entry_count = 0;
+		node->dirty_count = 0;
+		INIT_LIST_HEAD(&node->entries);
+		hash_add(cmt->node_ht, &node->hnode, tp_idx);
+		list_add(&node->lru, &cmt->node_lru);
+		cmt->node_size++;
+	}
+
+	e = list_first_entry(&cmt->entry_free_list, struct cmt_entry, sibling);
+	list_del(&e->sibling);
 	e->lpn = lpn;
 	e->ppa = ppa;
 	e->dirty = dirty;
-	hash_add(cmt->ht, &e->hnode, lpn);
-	list_add(&e->lru, &cmt->lru_list);
-	cmt->size++;
+	e->parent = node;
+	hash_add(cmt->entry_ht, &e->hnode, lpn);
+	list_add(&e->sibling, &node->entries);
+	node->entry_count++;
+	if (dirty)
+		node->dirty_count++;
+	cmt->entry_size++;
 	return e;
 }
 
 static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
-	uint32_t tp_idx = lpn / entries_per_tp;
-	uint32_t entry_idx = lpn % entries_per_tp;
+	uint32_t ents_per_tp = entries_per_tp(conv_ftl);
+	uint32_t tp_idx = lpn / ents_per_tp;
+	uint32_t entry_idx = lpn % ents_per_tp;
 	struct ppa tp_ppa = conv_ftl->gtd[tp_idx];
 	struct ppa *tp_buf;
 	struct nand_cmd rd;
@@ -518,8 +593,8 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 	nsecs_latest = max(nsecs_completed, nsecs_latest);
 	*stime = nsecs_latest;
 
-	/* ns->mapped에서 해당 entry 읽기 */
-	tp_buf = (struct ppa *)(conv_ftl->mapped + ppa2pgidx(conv_ftl, &tp_ppa) * spp->pgsz);
+	/* 전용 버퍼에서 tp_idx 슬롯의 해당 entry 읽기 */
+	tp_buf = (struct ppa *)(conv_ftl->tp_map + (size_t)tp_idx * spp->pgsz);
 	return tp_buf[entry_idx];
 }
 
@@ -540,7 +615,10 @@ static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa
 	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
 	if (e) {
 		e->ppa = ppa;
-		e->dirty = true;
+		if (!e->dirty) {
+			e->dirty = true;
+			e->parent->dirty_count++;
+		}
 		return;
 	}
 
@@ -646,8 +724,6 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	ns->nr_parts = nr_parts;
 	ns->ftls = (void *)conv_ftls;
 	ns->size = (uint64_t)((size * 100) / cpp.pba_pcent);
-	for (i = 0; i < nr_parts; i++)
-		conv_ftls[i].mapped = mapped_addr;
 	ns->mapped = mapped_addr;
 	/*register io command handler*/
 	ns->proc_io_cmd = conv_proc_nvme_io_cmd;
@@ -854,9 +930,8 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	advance_write_pointer(conv_ftl, GC_IO);
 
 	if (lpn >= TRANS_LPN_BASE) {
+		/* TP 내용물은 tp_idx 슬롯에 고정이라 복사 불필요, GTD만 갱신 */
 		uint32_t tp_idx = (uint32_t)(lpn - TRANS_LPN_BASE);
-		memcpy(conv_ftl->mapped + ppa2pgidx(conv_ftl, &new_ppa) * spp->pgsz,
-		       conv_ftl->mapped + ppa2pgidx(conv_ftl, old_ppa) * spp->pgsz, spp->pgsz);
 		conv_ftl->gtd[tp_idx] = new_ppa;
 	} else {
 		uint64_t stime = 0;

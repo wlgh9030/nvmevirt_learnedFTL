@@ -1,2 +1,6 @@
 # Define local configurations. DO NOT push the local configuration
-#KERNELDIR := /path/to/other/kernel/source
+KERNELDIR := /mnt/share/linux-5.15.0
+
+# The shared kernel tree's objtool was built on the host with a newer glibc
+# than this VM has, so skip objtool for this external module build.
+export OBJECT_FILES_NON_STANDARD := y
