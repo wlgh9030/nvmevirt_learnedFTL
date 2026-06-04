@@ -23,6 +23,11 @@
 #define LR_FP_SHIFT 16		/* fixed-point fractional bits (kernel has no FPU) */
 #define GC_BATCH_LINES 4	/* victim lines batched per do_gc for segment cleaning */
 
+/* GTD-entry grouping for group-granular GC (LearnedFTL). A group owns
+ * TP_PER_GROUP consecutive translation pages; group_of(lpn) =
+ * (lpn / entries_per_tp) / TP_PER_GROUP. */
+#define TP_PER_GROUP 64
+
 /* one piecewise-linear segment: pgidx ~= (w_fp*x + b_fp) >> LR_FP_SHIFT, x = lpn - start_lpn */
 struct lr_breakpoint {
 	int64_t w_fp; /* slope, fixed-point */
@@ -120,6 +125,13 @@ struct write_flow_control {
 	uint32_t credits_to_refill;
 };
 
+/* per-group accounting for group-granular GC (LearnedFTL).
+ * Phase 1 tracks only valid_pages (live DATA pages whose lpn maps into the
+ * group); invalid/used-line accounting arrives with group-owned allocation. */
+struct gtd_group {
+	uint32_t valid_pages;
+};
+
 struct conv_ftl {
 	struct ssd *ssd;
 
@@ -130,6 +142,9 @@ struct conv_ftl {
 	struct dftl_cmt cmt;
 	uint32_t num_tp;
 	void *tp_map; /* translation page content store, indexed by tp_idx */
+
+	uint32_t num_groups; /* DIV_ROUND_UP(num_tp, TP_PER_GROUP) */
+	struct gtd_group *groups; /* size num_groups, indexed by group_of(lpn) */
 
 	struct lr_node *lr_nodes; /* learned-index models, indexed by tp_idx (size num_tp) */
 	uint8_t *bitmaps; /* per-lpn: 1 if model predicts it exactly (size tt_pgs) */

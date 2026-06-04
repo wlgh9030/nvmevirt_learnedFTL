@@ -403,6 +403,12 @@ static inline uint32_t entries_per_tp(struct conv_ftl *conv_ftl)
 	return conv_ftl->ssd->sp.pgsz / sizeof(struct ppa); // => 512
 }
 
+/* group id that owns lpn's translation page (LearnedFTL GTD-entry grouping) */
+static inline uint32_t group_of(struct conv_ftl *conv_ftl, uint64_t lpn)
+{
+	return (uint32_t)((lpn / entries_per_tp(conv_ftl)) / TP_PER_GROUP);
+}
+
 /* ---- learned index: fixed-point linear regression (kernel has no FPU) ---- */
 
 /* in-place sort of (x[], y[]) pairs by x ascending (quicksort, port of util.c) */
@@ -593,6 +599,16 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 
 	conv_ftl->num_tp = DIV_ROUND_UP(spp->tt_pgs, entries_per_tp(conv_ftl));
 
+	/* GTD-entry groups for group-granular GC (LearnedFTL) */
+	conv_ftl->num_groups = DIV_ROUND_UP(conv_ftl->num_tp, TP_PER_GROUP);
+	conv_ftl->groups = vzalloc(sizeof(struct gtd_group) * conv_ftl->num_groups);
+
+	NVMEV_INFO("FTL geometry: tt_pgs=%ld tt_lines=%d pgs_per_line=%d ents_per_tp=%u "
+		   "num_tp=%u TP_PER_GROUP=%d num_groups=%u reserve=%u\n",
+		   (long)spp->tt_pgs, (int)spp->tt_lines, (int)spp->pgs_per_line,
+		   entries_per_tp(conv_ftl), conv_ftl->num_tp, TP_PER_GROUP,
+		   conv_ftl->num_groups, conv_ftl->cp.gc_thres_lines);
+
 	conv_ftl->gtd = vmalloc(sizeof(struct ppa) * conv_ftl->num_tp);
 	for (i = 0; i < conv_ftl->num_tp; i++) {
 		conv_ftl->gtd[i].ppa = UNMAPPED_PPA;
@@ -667,8 +683,49 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 	vfree(conv_ftl->bitmaps);
 	vfree(conv_ftl->gc_train_lpns);
 	vfree(conv_ftl->gc_train_pgidxs);
+	vfree(conv_ftl->groups);
 	vfree(conv_ftl->cmt.entry_pool);
 	vfree(conv_ftl->cmt.node_pool);
+}
+
+/* Phase 1 verification: independently recount valid DATA pages per group by
+ * scanning all physical pages, and compare against the maintained groups[]
+ * counters. Valid pages keep rmap==lpn, so this is a fully independent check.
+ * Must run before rmap/lines are torn down. */
+static void dftl_group_stats_check(struct conv_ftl *conv_ftl)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t *scan;
+	uint64_t pgidx;
+	uint32_t g;
+	bool ok = true;
+
+	scan = vzalloc(sizeof(uint32_t) * conv_ftl->num_groups);
+	if (!scan)
+		return;
+
+	for (pgidx = 0; pgidx < spp->tt_pgs; pgidx++) {
+		struct ppa ppa = pgidx2ppa(conv_ftl, pgidx);
+		struct nand_page *pg = get_pg(conv_ftl->ssd, &ppa);
+		uint64_t lpn;
+
+		if (pg->status != PG_VALID)
+			continue;
+		lpn = get_rmap_ent(conv_ftl, &ppa);
+		if (lpn >= TRANS_LPN_BASE) /* translation page or unmapped */
+			continue;
+		scan[group_of(conv_ftl, lpn)]++;
+	}
+
+	for (g = 0; g < conv_ftl->num_groups; g++) {
+		if (scan[g] != conv_ftl->groups[g].valid_pages) {
+			NVMEV_INFO("GROUP STATS MISMATCH g=%u maintained=%u scan=%u\n", g,
+				   conv_ftl->groups[g].valid_pages, scan[g]);
+			ok = false;
+		}
+	}
+	NVMEV_INFO("GROUP STATS %s (%u groups)\n", ok ? "OK" : "FAIL", conv_ftl->num_groups);
+	vfree(scan);
 }
 
 static struct tp_node *node_lookup(struct dftl_cmt *cmt, uint32_t tp_idx)
@@ -782,6 +839,7 @@ static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
 	hash_for_each_possible(cmt->entry_ht, entry, hnode, lpn) { /* hash값에 해당하는 버킷에서 */
 		if (entry->lpn == lpn) { /* 해당하는 lpn이 있으면 반환 */
 			list_move(&entry->parent->lru, &cmt->node_lru); /* parent TPnode -> MRU */
+			list_move(&entry->sibling, &entry->parent->entries);
 			atomic64_inc(&cmt_hits);
 			return entry;
 		}
@@ -790,30 +848,46 @@ static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
 	return NULL; /* 없으면 lookup failure */
 }
 
-/* LRU tail TPnode를 통째로 evict한다. dirty가 있으면 1회 batch writeback. */
-static void cmt_evict_node(struct conv_ftl *conv_ftl, uint64_t *stime)
+/* LRU tail TPnode에서 entry 하나만 evict한다. dirty victim이면 TP 전체를 flush해
+ * 같은 TPnode에 남은 dirty entries는 clean으로 유지한다. */
+static void cmt_evict_entry(struct conv_ftl *conv_ftl, uint64_t *stime)
 {
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
 	struct tp_node *node;
-	struct cmt_entry *e, *tmp;
+	struct cmt_entry *e, *victim = NULL;
 
 	node = list_last_entry(&cmt->node_lru, struct tp_node, lru);
 
-	if (node->dirty_count > 0)
-		tp_writeback_node(conv_ftl, node, stime);
-
-	list_for_each_entry_safe(e, tmp, &node->entries, sibling) {
-		hash_del(&e->hnode);
-		list_del(&e->sibling);
-		list_add(&e->sibling, &cmt->entry_free_list);
-		cmt->entry_size--;
+	list_for_each_entry_reverse(e, &node->entries, sibling) {
+		if (!e->dirty) {
+			victim = e;
+			break;
+		}
 	}
 
-	hash_del(&node->hnode);
-	list_del(&node->lru);
-	list_add(&node->lru, &cmt->node_free_list);
-	cmt->node_size--;
-	atomic64_inc(&cmt_node_evicts);
+	if (!victim)
+		victim = list_last_entry(&node->entries, struct cmt_entry, sibling);
+
+	if (victim->dirty)
+		tp_writeback_node(conv_ftl, node, stime);
+
+	hash_del(&victim->hnode);
+	list_del(&victim->sibling);
+	victim->lpn = INVALID_LPN;
+	victim->ppa.ppa = UNMAPPED_PPA;
+	victim->dirty = false;
+	victim->parent = NULL;
+	list_add(&victim->sibling, &cmt->entry_free_list);
+	node->entry_count--;
+	cmt->entry_size--;
+
+	if (node->entry_count == 0) {
+		hash_del(&node->hnode);
+		list_del(&node->lru);
+		list_add(&node->lru, &cmt->node_free_list);
+		cmt->node_size--;
+		atomic64_inc(&cmt_node_evicts);
+	}
 }
 
 static struct cmt_entry *cmt_insert(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa,
@@ -830,11 +904,11 @@ retry:
 	if (node)
 		list_move(&node->lru, &cmt->node_lru);
 
-	/* entry 풀이 가득 차면 LRU tail 노드 evict.
+	/* entry 풀이 가득 차면 LRU tail TPnode에서 entry 하나를 evict.
 	 * node_size <= entry_size 이므로 entry 검사가 node 풀 검사도 포괄.
 	 * 노드가 1개뿐인 degenerate 케이스에선 우리 노드가 evict될 수 있으므로 retry. */
 	if (cmt->entry_size >= cmt->entry_capacity) {
-		cmt_evict_node(conv_ftl, stime);
+		cmt_evict_entry(conv_ftl, stime);
 		goto retry;
 	}
 
@@ -973,7 +1047,8 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 	ppa = tp_load(conv_ftl, lpn, stime);
 	cmt_insert(conv_ftl, lpn, ppa, false, stime);
 
-	/* cmt_insert() may evict a dirty TP node, and that writeback (tp_flush_idx)
+	/* cmt_insert() may evict a dirty entry and flush its TPnode; that writeback
+	 * (tp_flush_idx)
 	 * consumes a write credit which can trigger a foreground GC *re-entrantly*.
 	 * Such a GC can relocate THIS lpn and erase the page tp_load() just returned,
 	 * leaving `ppa` stale (now PG_FREE). tp_map is write-through and GC keeps it
@@ -1072,6 +1147,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
+	dftl_group_stats_check(conv_ftl); /* before rmap/lines teardown */
 	remove_lines(conv_ftl);
 	remove_rmap(conv_ftl);
 	//remove_maptbl(conv_ftl);
@@ -1247,6 +1323,15 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		pqueue_insert(lm->victim_line_pq, line);
 		lm->victim_line_cnt++;
 	}
+
+	/* group stats: DATA page leaving valid (rmap still holds lpn here; the
+	 * caller clears it afterwards) */
+	{
+		uint64_t lpn = get_rmap_ent(conv_ftl, ppa);
+
+		if (lpn < TRANS_LPN_BASE)
+			conv_ftl->groups[group_of(conv_ftl, lpn)].valid_pages--;
+	}
 }
 
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -1270,6 +1355,14 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	line = get_line(conv_ftl, ppa);
 	NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
 	line->vpc++;
+
+	/* group stats: DATA page becoming valid (callers set rmap before this) */
+	{
+		uint64_t lpn = get_rmap_ent(conv_ftl, ppa);
+
+		if (lpn < TRANS_LPN_BASE)
+			conv_ftl->groups[group_of(conv_ftl, lpn)].valid_pages++;
+	}
 }
 
 static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -1282,9 +1375,21 @@ static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	for (i = 0; i < spp->pgs_per_blk; i++) {
 		struct ppa page_ppa = *ppa;
 
-		/* reset page status */
+		page_ppa.g.pg = i;
 		pg = &blk->pg[i];
 		NVMEV_ASSERT(pg->nsecs == spp->secs_per_pg);
+
+		/* group stats: a live DATA page in this line is being freed. Its
+		 * relocated copy already did valid_pages++ in gc_write_page, so this
+		 * decrement balances the move; invalid pages keep no rmap link. */
+		if (pg->status == PG_VALID) {
+			uint64_t lpn = get_rmap_ent(conv_ftl, &page_ppa);
+
+			if (lpn < TRANS_LPN_BASE)
+				conv_ftl->groups[group_of(conv_ftl, lpn)].valid_pages--;
+		}
+
+		/* reset page status */
 		pg->status = PG_FREE;
 
 		/* Erasing a block also clears its OOB, so drop the stale reverse-map
@@ -1293,7 +1398,6 @@ static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		 * — which verifies a prediction solely via get_rmap_ent(ppa)==lpn — can
 		 * accept a freed page and hand it back to conv_write, tripping
 		 * NVMEV_ASSERT(pg->status == PG_VALID) in mark_page_invalid(). */
-		page_ppa.g.pg = i;
 		set_rmap_ent(conv_ftl, INVALID_LPN, &page_ppa);
 	}
 
