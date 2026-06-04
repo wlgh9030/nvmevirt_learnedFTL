@@ -23,6 +23,9 @@ static atomic64_t model_hits = ATOMIC64_INIT(0);
 static atomic64_t gc_runs = ATOMIC64_INIT(0);
 static atomic64_t gc_reloc_pages = ATOMIC64_INIT(0);
 static atomic64_t gc_groups = ATOMIC64_INIT(0);
+static atomic64_t gc_group_targeted =
+	ATOMIC64_INIT(0); /* do_gc passes that targeted a real group */
+static atomic64_t gc_fallback = ATOMIC64_INIT(0); /* do_gc passes that fell back to global victim */
 
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -615,8 +618,8 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 	NVMEV_INFO("FTL geometry: tt_pgs=%ld tt_lines=%d pgs_per_line=%d ents_per_tp=%u "
 		   "num_tp=%u TP_PER_GROUP=%d num_groups=%u frontiers=%u reserve=%u\n",
 		   (long)spp->tt_pgs, (int)spp->tt_lines, (int)spp->pgs_per_line,
-		   entries_per_tp(conv_ftl), conv_ftl->num_tp, TP_PER_GROUP,
-		   conv_ftl->num_groups, conv_ftl->num_groups + 2, conv_ftl->cp.gc_thres_lines);
+		   entries_per_tp(conv_ftl), conv_ftl->num_tp, TP_PER_GROUP, conv_ftl->num_groups,
+		   conv_ftl->num_groups + 2, conv_ftl->cp.gc_thres_lines);
 
 	/* free-line safety margin: host-writable lines + reserve must fit in tt_lines,
 	 * with enough slack to absorb partial-fill waste of the open frontiers */
@@ -625,10 +628,11 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 					       conv_ftl->cp.pba_pcent / spp->pgs_per_line);
 		int usable = (int)spp->tt_lines - (int)conv_ftl->cp.gc_thres_lines;
 
-		NVMEV_INFO("FTL line budget: namespace~%u lines, usable=%d (tt_lines %d - reserve %u), "
-			   "slack=%d, frontiers=%u\n",
-			   ns_lines, usable, (int)spp->tt_lines, conv_ftl->cp.gc_thres_lines,
-			   usable - (int)ns_lines, conv_ftl->num_groups + 2);
+		NVMEV_INFO(
+			"FTL line budget: namespace~%u lines, usable=%d (tt_lines %d - reserve %u), "
+			"slack=%d, frontiers=%u\n",
+			ns_lines, usable, (int)spp->tt_lines, conv_ftl->cp.gc_thres_lines,
+			usable - (int)ns_lines, conv_ftl->num_groups + 2);
 		if (usable - (int)ns_lines < (int)conv_ftl->num_groups)
 			NVMEV_INFO("FTL WARNING: line slack < num_groups — raise OP_AREA_PERCENT "
 				   "if GC wedges under full-device writes\n");
@@ -697,10 +701,12 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 		   atomic64_read(&model_trains), atomic64_read(&model_bits_set),
 		   atomic64_read(&model_uses), atomic64_read(&model_hits));
 
-	NVMEV_INFO("GC diag: runs=%lld reloc_pages=%lld groups=%lld under_thresh=%lld\n",
+	NVMEV_INFO("GC diag: runs=%lld reloc_pages=%lld groups=%lld under_thresh=%lld "
+		   "group_gc=%lld fallback_gc=%lld\n",
 		   atomic64_read(&gc_runs), atomic64_read(&gc_reloc_pages),
 		   atomic64_read(&gc_groups),
-		   atomic64_read(&gc_groups) - atomic64_read(&model_trains));
+		   atomic64_read(&gc_groups) - atomic64_read(&model_trains),
+		   atomic64_read(&gc_group_targeted), atomic64_read(&gc_fallback));
 
 	vfree(conv_ftl->gtd);
 	vfree(conv_ftl->tp_map);
@@ -764,6 +770,23 @@ static void dftl_group_stats_check(struct conv_ftl *conv_ftl)
 			ok = false;
 		}
 	}
+
+	/* invalid_pages must equal the sum of ipc over each group's owned lines */
+	memset(scan, 0, sizeof(uint32_t) * conv_ftl->num_groups);
+	for (pgidx = 0; pgidx < conv_ftl->lm.tt_lines; pgidx++) {
+		struct line *ln = &conv_ftl->lm.lines[pgidx];
+
+		if (ln->group != GROUP_NONE)
+			scan[ln->group] += (uint32_t)ln->ipc;
+	}
+	for (g = 0; g < conv_ftl->num_groups; g++) {
+		if (scan[g] != conv_ftl->groups[g].invalid_pages) {
+			NVMEV_INFO("GROUP INVALID MISMATCH g=%u maintained=%u scan=%u\n", g,
+				   conv_ftl->groups[g].invalid_pages, scan[g]);
+			ok = false;
+		}
+	}
+
 	NVMEV_INFO("GROUP STATS %s (%u groups)\n", ok ? "OK" : "FAIL", conv_ftl->num_groups);
 	vfree(scan);
 }
@@ -1371,12 +1394,17 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	}
 
 	/* group stats: DATA page leaving valid (rmap still holds lpn here; the
-	 * caller clears it afterwards) */
+	 * caller clears it afterwards). valid_pages is keyed by the lpn's group;
+	 * invalid_pages by the line's owning group (== sum of owned-line ipc), so a
+	 * group's reclaimable garbage is well-defined for victim selection. */
 	{
 		uint64_t lpn = get_rmap_ent(conv_ftl, ppa);
 
-		if (lpn < TRANS_LPN_BASE)
+		if (lpn < TRANS_LPN_BASE) {
 			conv_ftl->groups[group_of(conv_ftl, lpn)].valid_pages--;
+			if (line->group != GROUP_NONE)
+				conv_ftl->groups[line->group].invalid_pages++;
+		}
 	}
 }
 
@@ -1564,6 +1592,59 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 	return victim_line;
 }
 
+/* Pick the data group with the most invalid pages (reclaimable garbage). Returns
+ * GROUP_NONE if no group has any. invalid_pages == sum of the group's owned-line
+ * ipc, so this directly targets the group with the most to reclaim. */
+static int pick_most_invalid_group(struct conv_ftl *conv_ftl)
+{
+	uint32_t g;
+	int best = GROUP_NONE;
+	uint32_t best_ipc = 0;
+
+	for (g = 0; g < conv_ftl->num_groups; g++) {
+		if (conv_ftl->groups[g].invalid_pages > best_ipc) {
+			best_ipc = conv_ftl->groups[g].invalid_pages;
+			best = (int)g;
+		}
+	}
+	return best;
+}
+
+/* Select the lowest-vpc victim line owned by `group` and detach it from the
+ * shared victim pqueue. A victim line is one currently in the pq (pos != 0).
+ * Returns NULL if `group` has no (eligible) victim. */
+static struct line *select_victim_line_grp(struct conv_ftl *conv_ftl, int group)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct line_mgmt *lm = &conv_ftl->lm;
+	struct line *best = NULL;
+	uint32_t i;
+
+	for (i = 0; i < lm->tt_lines; i++) {
+		struct line *ln = &lm->lines[i];
+
+		if (ln->pos == 0 || ln->group != group) /* not a victim of this group */
+			continue;
+		if (!best || ln->vpc < best->vpc)
+			best = ln;
+	}
+
+	/* Only prefer a group victim when it is invalid-heavy enough that relocating
+	 * its surviving valid pages still nets reclaimed space. Otherwise return NULL
+	 * so do_gc falls back to the global lowest-vpc victim (space-efficient). This
+	 * keeps group GC from starving the free list under near-full, light-garbage
+	 * loads (the 'learned' workload: there it degenerates to the proven Phase-2
+	 * global selection) while still doing group-directed GC when a group has
+	 * accumulated real garbage (the 'bug-rw' workload). */
+	if (!best || best->vpc > spp->pgs_per_line / 2)
+		return NULL;
+
+	pqueue_remove(lm->victim_line_pq, best);
+	best->pos = 0;
+	lm->victim_line_cnt--;
+	return best;
+}
+
 /* here ppa identifies the block we want to clean */
 static void clean_one_block(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -1709,6 +1790,9 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct line_mgmt *lm = &conv_ftl->lm;
 	struct line *line = get_line(conv_ftl, ppa);
+	/* drop this line's invalid pages from its group's running count before reset */
+	if (line->group != GROUP_NONE)
+		conv_ftl->groups[line->group].invalid_pages -= line->ipc;
 	line->ipc = 0;
 	line->vpc = 0;
 	line->group = GROUP_NONE; /* released line is no longer owned by any group */
@@ -1723,20 +1807,33 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	struct ppa ppa;
 	int flashpg, k, b;
 	int nlines = 0;
+	int target;
 
 	conv_ftl->gc_train_cnt = 0;
 	conv_ftl->wfc.credits_to_refill = 0;
 
 	/*
-	 * Stage A — batch up to GC_BATCH_LINES victim lines: relocate translation pages
-	 * immediately, gather data-page LPNs into the shared buffer, and erase + free each
-	 * victim right away so its space becomes reusable for the relocation below. Pooling
-	 * several lines' data before the LPN sort lengthens the per-translation-page runs
-	 * (segment cleaning), so the learned index fits across line boundaries.
+	 * Stage A — group-granular victim selection (LearnedFTL): target the group with
+	 * the most reclaimable garbage and batch up to GC_BATCH_LINES of *its* victim
+	 * lines, so all collected data belongs to one group and Stage B/D sort + retrain
+	 * it as a unit. If that group has no reclaimable victim, fall back to the global
+	 * best victim so a pass never reclaims nothing. Each victim: relocate translation
+	 * pages immediately, gather data-page LPNs, erase + free right away.
 	 */
-	for (b = 0; b < GC_BATCH_LINES; b++) {
-		struct line *victim_line = select_victim_line(conv_ftl, force);
+	target = pick_most_invalid_group(conv_ftl);
 
+	for (b = 0; b < GC_BATCH_LINES; b++) {
+		struct line *victim_line = NULL;
+
+		/* prefer the most-invalid group's victims (group-granular cleaning), but
+		 * always fill the rest of the batch from the global best victim once that
+		 * group runs out, so every pass reclaims a full batch of lines. Otherwise a
+		 * group with few victims frees too few lines per pass and the free list
+		 * starves (free line exhaustion -> stale curline -> PG_FREE assert). */
+		if (target != GROUP_NONE)
+			victim_line = select_victim_line_grp(conv_ftl, target);
+		if (!victim_line)
+			victim_line = select_victim_line(conv_ftl, force);
 		if (!victim_line)
 			break;
 
@@ -1787,6 +1884,16 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 	if (nlines == 0)
 		return -1;
+
+	if (target != GROUP_NONE)
+		atomic64_inc(&gc_group_targeted);
+	else
+		atomic64_inc(&gc_fallback);
+
+	/* pace GC: ensure at least a line's worth of write credits before the next
+	 * foreground_gc check, so small-ipc victims don't trigger a re-entry storm */
+	if (conv_ftl->wfc.credits_to_refill < spp->pgs_per_line)
+		conv_ftl->wfc.credits_to_refill = spp->pgs_per_line;
 
 	/*
 	 * Stage B — sort the whole batch's data LPNs ascending. Relocating in this order makes

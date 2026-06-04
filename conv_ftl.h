@@ -132,7 +132,8 @@ struct write_flow_control {
  * Phase 1 tracks only valid_pages (live DATA pages whose lpn maps into the
  * group); invalid/used-line accounting arrives with group-owned allocation. */
 struct gtd_group {
-	uint32_t valid_pages;
+	uint32_t valid_pages; /* live DATA pages whose lpn maps into this group */
+	uint32_t invalid_pages; /* invalid DATA pages in this group's lines (== sum of owned-line ipc) */
 };
 
 struct conv_ftl {
