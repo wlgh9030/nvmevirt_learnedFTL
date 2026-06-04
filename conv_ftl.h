@@ -27,6 +27,7 @@
  * TP_PER_GROUP consecutive translation pages; group_of(lpn) =
  * (lpn / entries_per_tp) / TP_PER_GROUP. */
 #define TP_PER_GROUP 64
+#define GROUP_NONE (-1) /* line/wp not owned by a data group (gc/trans frontier) */
 
 /* one piecewise-linear segment: pgidx ~= (w_fp*x + b_fp) >> LR_FP_SHIFT, x = lpn - start_lpn */
 struct lr_breakpoint {
@@ -91,6 +92,7 @@ struct line {
 	int id; /* line id, the same as corresponding block id */
 	int ipc; /* invalid page count in this line */
 	int vpc; /* valid page count in this line */
+	int group; /* owning data group, or GROUP_NONE (gc/trans/free line) */
 	struct list_head entry;
 	/* position in the priority queue for victim lines */
 	size_t pos;
@@ -104,6 +106,7 @@ struct write_pointer {
 	uint32_t pg;
 	uint32_t blk;
 	uint32_t pl;
+	int group; /* data group this frontier writes for, or GROUP_NONE */
 };
 
 struct line_mgmt {
@@ -155,7 +158,7 @@ struct conv_ftl {
 	int gc_train_cnt;
 
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
-	struct write_pointer wp;
+	struct write_pointer *group_wp; /* per-group user write frontiers, size num_groups */
 	struct write_pointer gc_wp;
 	struct write_pointer trans_wp; /* translation page writeback frontier */
 	struct line_mgmt lm;

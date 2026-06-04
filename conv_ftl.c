@@ -199,6 +199,7 @@ static void init_lines(struct conv_ftl *conv_ftl)
 			.id = i,
 			.ipc = 0,
 			.vpc = 0,
+			.group = GROUP_NONE,
 			.pos = 0,
 			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
 		};
@@ -249,11 +250,11 @@ static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 	return curline;
 }
 
+/* USER_IO writes go through conv_ftl->group_wp[group_of(lpn)] directly; this
+ * resolves the single GC / translation frontiers only. */
 static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 {
-	if (io_type == USER_IO) {
-		return &ftl->wp;
-	} else if (io_type == GC_IO) {
+	if (io_type == GC_IO) {
 		return &ftl->gc_wp;
 	} else if (io_type == TRANS_IO) {
 		return &ftl->trans_wp;
@@ -263,14 +264,14 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 	return NULL;
 }
 
-static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
+static void prepare_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer *wp, int group)
 {
-	struct write_pointer *wp = __get_wp(conv_ftl, io_type);
 	struct line *curline = get_next_free_line(conv_ftl);
 
 	NVMEV_ASSERT(wp);
 	NVMEV_ASSERT(curline);
 
+	curline->group = group;
 	/* wp->curline is always our next-to-write super-block */
 	*wp = (struct write_pointer){
 		.curline = curline,
@@ -279,14 +280,14 @@ static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 		.pg = 0,
 		.blk = curline->id,
 		.pl = 0,
+		.group = group,
 	};
 }
 
-static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
+static void advance_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer *wpp)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct line_mgmt *lm = &conv_ftl->lm;
-	struct write_pointer *wpp = __get_wp(conv_ftl, io_type);
 
 	NVMEV_DEBUG_VERBOSE("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n", wpp->ch, wpp->lun,
 			    wpp->pl, wpp->blk, wpp->pg);
@@ -341,6 +342,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 			    __func__);
 		return;
 	}
+	wpp->curline->group = wpp->group; /* this frontier now owns the new line */
 	NVMEV_DEBUG_VERBOSE("wpp: got new clean line %d\n", wpp->curline->id);
 
 	wpp->blk = wpp->curline->id;
@@ -357,10 +359,9 @@ out:
 			    wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
 }
 
-static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type)
+static struct ppa get_new_page(struct conv_ftl *conv_ftl, struct write_pointer *wp)
 {
 	struct ppa ppa;
-	struct write_pointer *wp = __get_wp(conv_ftl, io_type);
 
 	ppa.ppa = 0;
 	ppa.g.ch = wp->ch;
@@ -397,6 +398,7 @@ static inline bool mapped_ppa(struct ppa *ppa);
 static struct tp_node *node_lookup(struct dftl_cmt *cmt, uint32_t tp_idx);
 static void tp_flush_idx(struct conv_ftl *conv_ftl, uint32_t tp_idx, struct tp_node *node,
 			 uint64_t *stime);
+static struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa);
 
 static inline uint32_t entries_per_tp(struct conv_ftl *conv_ftl)
 {
@@ -602,12 +604,35 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 	/* GTD-entry groups for group-granular GC (LearnedFTL) */
 	conv_ftl->num_groups = DIV_ROUND_UP(conv_ftl->num_tp, TP_PER_GROUP);
 	conv_ftl->groups = vzalloc(sizeof(struct gtd_group) * conv_ftl->num_groups);
+	conv_ftl->group_wp = vmalloc(sizeof(struct write_pointer) * conv_ftl->num_groups);
+
+	/* free-line reserve must cover every open frontier (num_groups user + gc +
+	 * trans) plus GC's own destination line, else a write burst drains the free
+	 * list and advance_write_pointer NULL-derefs (see group-based-gc-port notes). */
+	conv_ftl->cp.gc_thres_lines = conv_ftl->num_groups + 4;
+	conv_ftl->cp.gc_thres_lines_high = conv_ftl->num_groups + 4;
 
 	NVMEV_INFO("FTL geometry: tt_pgs=%ld tt_lines=%d pgs_per_line=%d ents_per_tp=%u "
-		   "num_tp=%u TP_PER_GROUP=%d num_groups=%u reserve=%u\n",
+		   "num_tp=%u TP_PER_GROUP=%d num_groups=%u frontiers=%u reserve=%u\n",
 		   (long)spp->tt_pgs, (int)spp->tt_lines, (int)spp->pgs_per_line,
 		   entries_per_tp(conv_ftl), conv_ftl->num_tp, TP_PER_GROUP,
-		   conv_ftl->num_groups, conv_ftl->cp.gc_thres_lines);
+		   conv_ftl->num_groups, conv_ftl->num_groups + 2, conv_ftl->cp.gc_thres_lines);
+
+	/* free-line safety margin: host-writable lines + reserve must fit in tt_lines,
+	 * with enough slack to absorb partial-fill waste of the open frontiers */
+	{
+		uint32_t ns_lines = (uint32_t)((uint64_t)spp->tt_pgs * 100 /
+					       conv_ftl->cp.pba_pcent / spp->pgs_per_line);
+		int usable = (int)spp->tt_lines - (int)conv_ftl->cp.gc_thres_lines;
+
+		NVMEV_INFO("FTL line budget: namespace~%u lines, usable=%d (tt_lines %d - reserve %u), "
+			   "slack=%d, frontiers=%u\n",
+			   ns_lines, usable, (int)spp->tt_lines, conv_ftl->cp.gc_thres_lines,
+			   usable - (int)ns_lines, conv_ftl->num_groups + 2);
+		if (usable - (int)ns_lines < (int)conv_ftl->num_groups)
+			NVMEV_INFO("FTL WARNING: line slack < num_groups — raise OP_AREA_PERCENT "
+				   "if GC wedges under full-device writes\n");
+	}
 
 	conv_ftl->gtd = vmalloc(sizeof(struct ppa) * conv_ftl->num_tp);
 	for (i = 0; i < conv_ftl->num_tp; i++) {
@@ -684,6 +709,7 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 	vfree(conv_ftl->gc_train_lpns);
 	vfree(conv_ftl->gc_train_pgidxs);
 	vfree(conv_ftl->groups);
+	vfree(conv_ftl->group_wp);
 	vfree(conv_ftl->cmt.entry_pool);
 	vfree(conv_ftl->cmt.node_pool);
 }
@@ -714,7 +740,21 @@ static void dftl_group_stats_check(struct conv_ftl *conv_ftl)
 		lpn = get_rmap_ent(conv_ftl, &ppa);
 		if (lpn >= TRANS_LPN_BASE) /* translation page or unmapped */
 			continue;
-		scan[group_of(conv_ftl, lpn)]++;
+		{
+			uint32_t gid = group_of(conv_ftl, lpn);
+			struct line *ln = get_line(conv_ftl, &ppa);
+
+			scan[gid]++;
+			/* a valid DATA page must live either in its own group's line
+			 * or in a GROUP_NONE line (GC-relocated via gc frontier) */
+			if (ln->group != GROUP_NONE && ln->group != (int)gid) {
+				NVMEV_INFO("GROUP ROUTING VIOLATION pgidx=%llu lpn=%llu "
+					   "line.group=%d expected=%u\n",
+					   (unsigned long long)pgidx, (unsigned long long)lpn,
+					   ln->group, gid);
+				ok = false;
+			}
+		}
 	}
 
 	for (g = 0; g < conv_ftl->num_groups; g++) {
@@ -761,9 +801,9 @@ static void tp_flush_idx(struct conv_ftl *conv_ftl, uint32_t tp_idx, struct tp_n
 		atomic64_add(node->dirty_count, &tp_writeback_entries_total);
 
 	/* 새 페이지 할당 — translation page 전용 frontier(trans_wp)에 쓴다 */
-	new_tp_ppa = get_new_page(conv_ftl, TRANS_IO);
+	new_tp_ppa = get_new_page(conv_ftl, &conv_ftl->trans_wp);
 	mark_page_valid(conv_ftl, &new_tp_ppa);
-	advance_write_pointer(conv_ftl, TRANS_IO);
+	advance_write_pointer(conv_ftl, &conv_ftl->trans_wp);
 
 	if (mapped_ppa(&old_tp_ppa)) {
 		/* 기존 TP read 지연 시뮬레이션 (read-modify-write) */
@@ -1132,10 +1172,16 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	/* initialize all the lines */
 	init_lines(conv_ftl);
 
-	/* initialize write pointer, this is how we allocate new pages for writes */
-	prepare_write_pointer(conv_ftl, USER_IO);
-	prepare_write_pointer(conv_ftl, GC_IO);
-	prepare_write_pointer(conv_ftl, TRANS_IO);
+	/* initialize write pointers: one user frontier per group, plus the shared
+	 * GC and translation frontiers (eager init — reserve covers all of them) */
+	{
+		uint32_t g;
+
+		for (g = 0; g < conv_ftl->num_groups; g++)
+			prepare_write_pointer(conv_ftl, &conv_ftl->group_wp[g], g);
+	}
+	prepare_write_pointer(conv_ftl, &conv_ftl->gc_wp, GROUP_NONE);
+	prepare_write_pointer(conv_ftl, &conv_ftl->trans_wp, GROUP_NONE);
 
 	init_write_flow_control(conv_ftl);
 
@@ -1437,7 +1483,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	uint32_t io_type = (lpn >= TRANS_LPN_BASE) ? TRANS_IO : GC_IO;
 
 	//NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-	new_ppa = get_new_page(conv_ftl, io_type);
+	new_ppa = get_new_page(conv_ftl, __get_wp(conv_ftl, io_type));
 	/* update maptbl */
 	//set_maptbl_ent(conv_ftl, lpn, &new_ppa);
 	/* update rmap */
@@ -1446,7 +1492,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	mark_page_valid(conv_ftl, &new_ppa);
 
 	/* need to advance the write pointer here */
-	advance_write_pointer(conv_ftl, io_type);
+	advance_write_pointer(conv_ftl, __get_wp(conv_ftl, io_type));
 
 	if (lpn >= TRANS_LPN_BASE) {
 		/* TP 내용물은 tp_idx 슬롯에 고정이라 복사 불필요, GTD만 갱신 */
@@ -1559,11 +1605,11 @@ static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn, ui
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct convparams *cpp = &conv_ftl->cp;
-	struct ppa new_ppa = get_new_page(conv_ftl, io_type);
+	struct ppa new_ppa = get_new_page(conv_ftl, __get_wp(conv_ftl, io_type));
 
 	set_rmap_ent(conv_ftl, lpn, &new_ppa);
 	mark_page_valid(conv_ftl, &new_ppa);
-	advance_write_pointer(conv_ftl, io_type);
+	advance_write_pointer(conv_ftl, __get_wp(conv_ftl, io_type));
 
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
@@ -1665,6 +1711,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	struct line *line = get_line(conv_ftl, ppa);
 	line->ipc = 0;
 	line->vpc = 0;
+	line->group = GROUP_NONE; /* released line is no longer owned by any group */
 	/* move this line to free line list */
 	list_add_tail(&line->entry, &lm->free_line_list);
 	lm->free_line_cnt++;
@@ -1943,19 +1990,24 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			NVMEV_DEBUG("%s: %lld is invalid, ", __func__, ppa2pgidx(conv_ftl, &ppa));
 		}
 
-		/* new write */
-		ppa = get_new_page(conv_ftl, USER_IO);
-		/* update maptbl */
-		//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
-		dftl_set_ppa(conv_ftl, local_lpn, ppa, &swr.stime);
-		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
-		/* update rmap */
-		set_rmap_ent(conv_ftl, local_lpn, &ppa);
+		/* new write — route to this lpn's group frontier (group-owned alloc) */
+		{
+			struct write_pointer *uwp =
+				&conv_ftl->group_wp[group_of(conv_ftl, local_lpn)];
 
-		mark_page_valid(conv_ftl, &ppa);
+			ppa = get_new_page(conv_ftl, uwp);
+			/* update maptbl */
+			//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+			dftl_set_ppa(conv_ftl, local_lpn, ppa, &swr.stime);
+			NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
+			/* update rmap */
+			set_rmap_ent(conv_ftl, local_lpn, &ppa);
 
-		/* need to advance the write pointer here */
-		advance_write_pointer(conv_ftl, USER_IO);
+			mark_page_valid(conv_ftl, &ppa);
+
+			/* need to advance the write pointer here */
+			advance_write_pointer(conv_ftl, uwp);
+		}
 
 		/* Aggregate write io in flash page */
 		if (last_pg_in_wordline(conv_ftl, &ppa)) {
