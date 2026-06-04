@@ -17,6 +17,28 @@
 #define CMT_NODE_HASH_SIZE (1 << CMT_NODE_HASH_BITS)
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
 
+/* learned index (LearnedFTL, HPCA'24) parameters */
+#define LR_MAX_INTERVALS 8	/* piecewise segments per translation page model */
+#define LR_TRAIN_THRESHOLD 30	/* min samples in a TP group to train a model */
+#define LR_FP_SHIFT 16		/* fixed-point fractional bits (kernel has no FPU) */
+#define GC_BATCH_LINES 4	/* victim lines batched per do_gc for segment cleaning */
+
+/* one piecewise-linear segment: pgidx ~= (w_fp*x + b_fp) >> LR_FP_SHIFT, x = lpn - start_lpn */
+struct lr_breakpoint {
+	int64_t w_fp; /* slope, fixed-point */
+	int64_t b_fp; /* intercept, fixed-point */
+	uint32_t key; /* upper bound (inclusive) of normalized lpn for this segment */
+	uint32_t valid_cnt; /* #samples this segment predicts exactly */
+};
+
+/* per translation-page linear-regression model */
+struct lr_node {
+	struct lr_breakpoint brks[LR_MAX_INTERVALS];
+	uint64_t start_lpn; /* model is relative to this lpn */
+	uint64_t start_ppa; /* ... and this pgidx */
+	uint8_t u; /* 1 if trained/usable */
+};
+
 struct tp_node;
 
 struct cmt_entry {
@@ -109,9 +131,18 @@ struct conv_ftl {
 	uint32_t num_tp;
 	void *tp_map; /* translation page content store, indexed by tp_idx */
 
+	struct lr_node *lr_nodes; /* learned-index models, indexed by tp_idx (size num_tp) */
+	uint8_t *bitmaps; /* per-lpn: 1 if model predicts it exactly (size tt_pgs) */
+
+	/* training sample collection during one line GC (size pgs_per_line each) */
+	uint64_t *gc_train_lpns;
+	uint64_t *gc_train_pgidxs;
+	int gc_train_cnt;
+
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
 	struct write_pointer wp;
 	struct write_pointer gc_wp;
+	struct write_pointer trans_wp; /* translation page writeback frontier */
 	struct line_mgmt lm;
 	struct write_flow_control wfc;
 };

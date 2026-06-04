@@ -3,6 +3,7 @@
 #include <linux/vmalloc.h>
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
+#include <linux/math64.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -13,6 +14,15 @@ static atomic64_t tp_loads = ATOMIC64_INIT(0);
 static atomic64_t tp_writebacks = ATOMIC64_INIT(0);
 static atomic64_t cmt_node_evicts = ATOMIC64_INIT(0);
 static atomic64_t tp_writeback_entries_total = ATOMIC64_INIT(0);
+
+static atomic64_t model_trains = ATOMIC64_INIT(0);
+static atomic64_t model_bits_set = ATOMIC64_INIT(0);
+static atomic64_t model_uses = ATOMIC64_INIT(0);
+static atomic64_t model_hits = ATOMIC64_INIT(0);
+/* GC/training diagnostics */
+static atomic64_t gc_runs = ATOMIC64_INIT(0);
+static atomic64_t gc_reloc_pages = ATOMIC64_INIT(0);
+static atomic64_t gc_groups = ATOMIC64_INIT(0);
 
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -44,17 +54,68 @@ static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struc
 static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint64_t oneshot = spp->pgs_per_oneshotpg;
+	uint64_t pu = (uint64_t)spp->nchs *
+		      spp->luns_per_ch; /* parallel blocks per line (pls_per_lun==1) */
+	uint64_t wl = ppa->g.pg / oneshot; /* wordline within block */
+	uint64_t pg_off = ppa->g.pg % oneshot; /* page within a oneshot (one channel run) */
 	uint64_t pgidx;
 
 	NVMEV_DEBUG_VERBOSE("%s: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n", __func__, ppa->g.ch,
 			    ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
 
-	pgidx = ppa->g.ch * spp->pgs_per_ch + ppa->g.lun * spp->pgs_per_lun +
-		ppa->g.pl * spp->pgs_per_pl + ppa->g.blk * spp->pgs_per_blk + ppa->g.pg;
+	/*
+	 * Allocation-order "virtual PPN": lay out (ch,lun,blk,pg) so that
+	 * advance_write_pointer's write order (pg_off -> ch -> lun -> wordline -> blk)
+	 * produces *consecutive* indices. A sequential write stream then yields a
+	 * sequential pgidx, so the learned index sees a (near-)linear lpn->pgidx instead
+	 * of the channel-striped sawtooth the old ch-major layout produced. Physical
+	 * striping (ch/lun) sits in the low digits; the per-channel page progression
+	 * (wordline, blk) in the high digits. pgidx2ppa() is the exact inverse.
+	 * Assumes pls_per_lun == 1 (matches advance_write_pointer / the TODO there).
+	 */
+	pgidx = (uint64_t)ppa->g.blk * spp->pgs_per_line + wl * (oneshot * pu) +
+		(uint64_t)ppa->g.lun * (oneshot * spp->nchs) + (uint64_t)ppa->g.ch * oneshot +
+		pg_off;
 
 	NVMEV_ASSERT(pgidx < spp->tt_pgs);
 
 	return pgidx;
+}
+
+/* inverse of ppa2pgidx: reconstruct a ppa from the allocation-order virtual PPN */
+static struct ppa pgidx2ppa(struct conv_ftl *conv_ftl, uint64_t pgidx)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint64_t oneshot = spp->pgs_per_oneshotpg;
+	uint64_t pu = (uint64_t)spp->nchs * spp->luns_per_ch;
+	uint64_t wl, pg_off;
+	struct ppa ppa;
+
+	// ppa.ppa = 0;
+	// ppa.g.ch = pgidx / spp->pgs_per_ch;
+	// pgidx %= spp->pgs_per_ch;
+	// ppa.g.lun = pgidx / spp->pgs_per_lun;
+	// pgidx %= spp->pgs_per_lun;
+	// ppa.g.pl = pgidx / spp->pgs_per_pl;
+	// pgidx %= spp->pgs_per_pl;
+	// ppa.g.blk = pgidx / spp->pgs_per_blk;
+	// pgidx %= spp->pgs_per_blk;
+	// ppa.g.pg = pgidx;
+
+	ppa.ppa = 0;
+	ppa.g.blk = pgidx / spp->pgs_per_line;
+	pgidx %= spp->pgs_per_line;
+	wl = pgidx / (oneshot * pu);
+	pgidx %= (oneshot * pu);
+	ppa.g.lun = pgidx / (oneshot * spp->nchs);
+	pgidx %= (oneshot * spp->nchs);
+	ppa.g.ch = pgidx / oneshot;
+	pg_off = pgidx % oneshot;
+	ppa.g.pl = 0;
+	ppa.g.pg = wl * oneshot + pg_off;
+
+	return ppa;
 }
 
 static inline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -194,6 +255,8 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 		return &ftl->wp;
 	} else if (io_type == GC_IO) {
 		return &ftl->gc_wp;
+	} else if (io_type == TRANS_IO) {
+		return &ftl->trans_wp;
 	}
 
 	NVMEV_ASSERT(0);
@@ -271,6 +334,13 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	/* current line is used up, pick another empty line */
 	check_addr(wpp->blk, spp->blks_per_pl);
 	wpp->curline = get_next_free_line(conv_ftl);
+	if (!wpp->curline) {
+		/* 최후보루: 예약(gc_thres_lines)이 충분하면 정상 운용에선 도달 불가.
+		 * 진짜 free line 고갈 시 주소 0 역참조 패닉 대신 로그만 남기고 빠진다. */
+		NVMEV_ERROR("%s: no free line left — device full, write pointer not advanced\n",
+			    __func__);
+		return;
+	}
 	NVMEV_DEBUG_VERBOSE("wpp: got new clean line %d\n", wpp->curline->id);
 
 	wpp->blk = wpp->curline->id;
@@ -324,10 +394,195 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static inline bool mapped_ppa(struct ppa *ppa);
+static struct tp_node *node_lookup(struct dftl_cmt *cmt, uint32_t tp_idx);
+static void tp_flush_idx(struct conv_ftl *conv_ftl, uint32_t tp_idx, struct tp_node *node,
+			 uint64_t *stime);
 
 static inline uint32_t entries_per_tp(struct conv_ftl *conv_ftl)
 {
-	return conv_ftl->ssd->sp.pgsz / sizeof(struct ppa);
+	return conv_ftl->ssd->sp.pgsz / sizeof(struct ppa); // => 512
+}
+
+/* ---- learned index: fixed-point linear regression (kernel has no FPU) ---- */
+
+/* in-place sort of (x[], y[]) pairs by x ascending (quicksort, port of util.c) */
+static void lr_sort_pairs(uint64_t *x, uint64_t *y, int low, int high)
+{
+	int i = low, j = high;
+	uint64_t px = x[(low + high) / 2];
+
+	while (i <= j) {
+		while (x[i] < px)
+			i++;
+		while (x[j] > px)
+			j--;
+		if (i <= j) {
+			uint64_t tx = x[i], ty = y[i];
+			x[i] = x[j];
+			y[i] = y[j];
+			x[j] = tx;
+			y[j] = ty;
+			i++;
+			j--;
+		}
+	}
+	if (low < j)
+		lr_sort_pairs(x, y, low, j);
+	if (i < high)
+		lr_sort_pairs(x, y, i, high);
+}
+
+/*
+ * Least squares fit of y = w*x + b over num points, returning w,b as
+ * LR_FP_SHIFT fixed-point. Returns false if the system is degenerate.
+ * x values are small (0..ents_per_tp) and y are group-normalized, so the
+ * intermediate sums fit comfortably in 64-bit signed integers.
+ */
+static bool lr_least_square(const uint64_t *x, const uint64_t *y, int num, int64_t *w_fp,
+			    int64_t *b_fp)
+{
+	int64_t t1 = 0, t2 = 0, t3 = 0, t4 = 0; /* sum x^2, sum x, sum xy, sum y */
+	int64_t den;
+	int i;
+
+	if (num <= 0)
+		return false;
+
+	for (i = 0; i < num; i++) {
+		int64_t xi = (int64_t)x[i];
+		int64_t yi = (int64_t)y[i];
+
+		t1 += xi * xi;
+		t2 += xi;
+		t3 += xi * yi;
+		t4 += yi;
+	}
+
+	den = t1 * num - t2 * t2;
+	if (den == 0)
+		return false;
+
+	*w_fp = div64_s64((t3 * num - t2 * t4) << LR_FP_SHIFT, den);
+	*b_fp = div64_s64((t1 * t4 - t2 * t3) << LR_FP_SHIFT, den);
+	return true;
+}
+
+/* evaluate the fixed-point model at x with round-to-nearest, clamped at 0 */
+static uint64_t lr_predict(uint64_t x, int64_t w_fp, int64_t b_fp)
+{
+	int64_t y = w_fp * (int64_t)x + b_fp;
+
+	y += (1LL << (LR_FP_SHIFT - 1)); /* round to nearest */
+	y >>= LR_FP_SHIFT;
+	if (y < 0)
+		y = 0;
+	return (uint64_t)y;
+}
+
+/*
+ * Train the model for one translation page from n (lpn, pgidx) samples that all
+ * belong to the same tp_idx. lpns/pgidxs are sorted by lpn ascending and are
+ * normalized in place. Port of FEMU model_training() single-group path:
+ * split into LR_MAX_INTERVALS piecewise segments, least-squares fit each, and
+ * mark bitmaps[lpn]=1 for samples the model reproduces exactly.
+ */
+static void lr_train_tp(struct conv_ftl *conv_ftl, uint64_t *lpns, uint64_t *pgidxs, int n)
+{
+	uint32_t ents_per_tp = entries_per_tp(conv_ftl);
+	uint32_t tp_idx = lpns[0] / ents_per_tp;
+	struct lr_node *node = &conv_ftl->lr_nodes[tp_idx];
+	uint64_t start_lpn = lpns[0];
+	uint64_t start_ppa = pgidxs[0];
+	int interval_num, j, i;
+
+	if (n <= LR_TRAIN_THRESHOLD)
+		return;
+
+	interval_num = n / LR_MAX_INTERVALS;
+	if (interval_num == 0)
+		return;
+
+	/* normalize samples relative to the segment origin */
+	for (i = 0; i < n; i++) {
+		lpns[i] -= start_lpn;
+		pgidxs[i] -= start_ppa;
+	}
+
+	node->start_lpn = start_lpn;
+	node->start_ppa = start_ppa;
+
+	for (j = 0; j < LR_MAX_INTERVALS; j++) {
+		int start = (j == 0) ? 0 : (j * interval_num);
+		int end = (j == LR_MAX_INTERVALS - 1) ? n : ((j + 1) * interval_num);
+		int num_p = end - start;
+		int64_t w_fp = 0, b_fp = 0;
+		uint32_t su = 0;
+
+		if (num_p <= 0) {
+			node->brks[j].key = (j == 0) ? 0 : node->brks[j - 1].key;
+			node->brks[j].w_fp = 0;
+			node->brks[j].b_fp = 0;
+			node->brks[j].valid_cnt = 0;
+			continue;
+		}
+
+		/* segment covers normalized lpns up to (inclusive) the last sample */
+		node->brks[j].key = lpns[end - 1];
+
+		if (lr_least_square(&lpns[start], &pgidxs[start], num_p, &w_fp, &b_fp)) {
+			node->brks[j].w_fp = w_fp;
+			node->brks[j].b_fp = b_fp;
+			for (i = start; i < end; i++) {
+				uint64_t pred = lr_predict(lpns[i], w_fp, b_fp);
+				if (pred == pgidxs[i]) {
+					su++;
+					conv_ftl->bitmaps[start_lpn + lpns[i]] = 1;
+				} else {
+					conv_ftl->bitmaps[start_lpn + lpns[i]] = 0;
+				}
+			}
+		} else {
+			node->brks[j].w_fp = 0;
+			node->brks[j].b_fp = 0;
+		}
+		node->brks[j].valid_cnt = su;
+		atomic64_add(su, &model_bits_set);
+	}
+
+	node->u = 1;
+	atomic64_inc(&model_trains);
+}
+
+/* train models from samples collected during the just-finished line GC */
+static void lr_train_collected(struct conv_ftl *conv_ftl)
+{
+	uint32_t ents_per_tp = entries_per_tp(conv_ftl);
+	int total = conv_ftl->gc_train_cnt;
+	int i, gstart;
+
+	atomic64_add(total, &gc_reloc_pages);
+	if (total <= 0)
+		return;
+
+	/* sort by lpn so that same-tp samples are contiguous */
+	lr_sort_pairs(conv_ftl->gc_train_lpns, conv_ftl->gc_train_pgidxs, 0, total - 1);
+
+	gstart = 0;
+	for (i = 1; i <= total; i++) {
+		bool boundary = (i == total) || (conv_ftl->gc_train_lpns[i] / ents_per_tp !=
+						 conv_ftl->gc_train_lpns[gstart] / ents_per_tp);
+		if (boundary) {
+			atomic64_inc(&gc_groups);
+			/* LearnedFTL처럼 데이터 GC에서는 모델만 재학습하고 translation
+			 * page는 NAND에 내리지 않는다. 매핑 정답은 tp_map(write-through)에
+			 * 이미 반영돼 있고, NAND 영속화는 trans frontier의 writeback이 담당. */
+			lr_train_tp(conv_ftl, &conv_ftl->gc_train_lpns[gstart],
+				    &conv_ftl->gc_train_pgidxs[gstart], i - gstart);
+			gstart = i;
+		}
+	}
+
+	conv_ftl->gc_train_cnt = 0;
 }
 
 static void init_dftl(struct conv_ftl *conv_ftl)
@@ -352,6 +607,22 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 		for (k = 0; k < n; k++)
 			p[k].ppa = UNMAPPED_PPA;
 	}
+
+	/* learned-index models: one per TP, all untrained (u=0) initially */
+	conv_ftl->lr_nodes = vmalloc(sizeof(struct lr_node) * conv_ftl->num_tp);
+	for (i = 0; i < conv_ftl->num_tp; i++)
+		conv_ftl->lr_nodes[i].u = 0;
+
+	/* per-lpn prediction bitmap, init all zero */
+	conv_ftl->bitmaps = vzalloc(spp->tt_pgs);
+
+	/* GC training sample buffers: up to GC_BATCH_LINES victim lines batched per GC,
+	 * so size for a full batch of data pages (one entry per line page per line). */
+	conv_ftl->gc_train_lpns =
+		vmalloc(sizeof(uint64_t) * (size_t)GC_BATCH_LINES * spp->pgs_per_line);
+	conv_ftl->gc_train_pgidxs =
+		vmalloc(sizeof(uint64_t) * (size_t)GC_BATCH_LINES * spp->pgs_per_line);
+	conv_ftl->gc_train_cnt = 0;
 
 	cmt->entry_pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
 	cmt->node_pool = vmalloc(sizeof(struct tp_node) * CMT_CAPACITY);
@@ -381,8 +652,21 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 		   wb, atomic64_read(&cmt_node_evicts), wb ? wb_entries / wb : 0,
 		   wb ? (wb_entries * 100 / wb) % 100 : 0);
 
+	NVMEV_INFO("LR model: trains=%lld bits_set=%lld uses=%lld hits=%lld\n",
+		   atomic64_read(&model_trains), atomic64_read(&model_bits_set),
+		   atomic64_read(&model_uses), atomic64_read(&model_hits));
+
+	NVMEV_INFO("GC diag: runs=%lld reloc_pages=%lld groups=%lld under_thresh=%lld\n",
+		   atomic64_read(&gc_runs), atomic64_read(&gc_reloc_pages),
+		   atomic64_read(&gc_groups),
+		   atomic64_read(&gc_groups) - atomic64_read(&model_trains));
+
 	vfree(conv_ftl->gtd);
 	vfree(conv_ftl->tp_map);
+	vfree(conv_ftl->lr_nodes);
+	vfree(conv_ftl->bitmaps);
+	vfree(conv_ftl->gc_train_lpns);
+	vfree(conv_ftl->gc_train_pgidxs);
 	vfree(conv_ftl->cmt.entry_pool);
 	vfree(conv_ftl->cmt.node_pool);
 }
@@ -398,27 +682,31 @@ static struct tp_node *node_lookup(struct dftl_cmt *cmt, uint32_t tp_idx)
 	return NULL;
 }
 
-static void tp_writeback_node(struct conv_ftl *conv_ftl, struct tp_node *node, uint64_t *stime)
+/*
+ * Flush translation page `tp_idx` to NAND. The page content is already current
+ * in tp_map (write-through via dftl_set_ppa / dftl_set_ppa_gc), so no entry copy
+ * is needed — this only models the read-modify-write + NAND write latency, moves
+ * the TP to a new physical page, and updates the GTD. If the TP is cached
+ * (`node` != NULL), the whole page is now persisted so its entries become clean.
+ */
+static void tp_flush_idx(struct conv_ftl *conv_ftl, uint32_t tp_idx, struct tp_node *node,
+			 uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	uint32_t ents_per_tp = entries_per_tp(conv_ftl);
-	struct ppa old_tp_ppa = conv_ftl->gtd[node->tp_idx];
+	struct ppa old_tp_ppa = conv_ftl->gtd[tp_idx];
 	struct ppa new_tp_ppa;
-	struct ppa *tp_buf;
 	struct cmt_entry *e;
 	struct nand_cmd cmd;
 	uint64_t nsecs_completed, nsecs_latest = *stime;
 
 	atomic64_inc(&tp_writebacks);
-	atomic64_add(node->dirty_count, &tp_writeback_entries_total);
+	if (node)
+		atomic64_add(node->dirty_count, &tp_writeback_entries_total);
 
-	/* 새 페이지 할당 (NAND 점유 시뮬레이션) */
-	new_tp_ppa = get_new_page(conv_ftl, GC_IO);
+	/* 새 페이지 할당 — translation page 전용 frontier(trans_wp)에 쓴다 */
+	new_tp_ppa = get_new_page(conv_ftl, TRANS_IO);
 	mark_page_valid(conv_ftl, &new_tp_ppa);
-	advance_write_pointer(conv_ftl, GC_IO);
-
-	/* TP 내용물은 물리 위치와 무관하게 tp_idx 슬롯에 고정 보관 */
-	tp_buf = (struct ppa *)(conv_ftl->tp_map + (size_t)node->tp_idx * spp->pgsz);
+	advance_write_pointer(conv_ftl, TRANS_IO);
 
 	if (mapped_ppa(&old_tp_ppa)) {
 		/* 기존 TP read 지연 시뮬레이션 (read-modify-write) */
@@ -438,37 +726,53 @@ static void tp_writeback_node(struct conv_ftl *conv_ftl, struct tp_node *node, u
 		set_rmap_ent(conv_ftl, INVALID_LPN, &old_tp_ppa);
 	}
 
-	/* batch patch: 노드의 모든 dirty entry를 한 번에 반영 */
-	list_for_each_entry(e, &node->entries, sibling) {
-		if (e->dirty) {
-			tp_buf[e->lpn % ents_per_tp] = e->ppa;
+	/* tp_map[tp_idx]는 write-through로 이미 최신 → 복사 불필요.
+	 * 캐시된 노드가 있으면 이번 flush로 전부 영속화되므로 clean 처리. */
+	if (node) {
+		list_for_each_entry(e, &node->entries, sibling)
 			e->dirty = false;
-		}
+		node->dirty_count = 0;
 	}
-	node->dirty_count = 0;
 
 	/* rmap에 translation page임을 기록 */
-	set_rmap_ent(conv_ftl, TRANS_LPN_BASE + node->tp_idx, &new_tp_ppa);
+	set_rmap_ent(conv_ftl, TRANS_LPN_BASE + tp_idx, &new_tp_ppa);
 
-	/* NAND write 지연 시뮬레이션 (wordline 단위) */
-	cmd = (struct nand_cmd){
-		.type = GC_IO,
-		.cmd = NAND_NOP,
-		.stime = nsecs_latest,
-		.interleave_pci_dma = false,
-		.ppa = &new_tp_ppa,
-	};
-	if (last_pg_in_wordline(conv_ftl, &new_tp_ppa)) {
-		cmd.cmd = NAND_WRITE;
-		cmd.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
-	}
-	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
-	nsecs_latest = max(nsecs_completed, nsecs_latest);
+	/*
+	 * NAND write 지연은 모델링하지 않는다 (원본 LearnedFTL translation_write_page와 동일).
+	 * dirty 매핑 writeback은 이 요청의 critical path 밖(비동기로 숨겨짐)이라, program
+	 * 지연을 트리거 요청에 동기로 부과하면 과대계상이 된다. 공간(free line) 소비는
+	 * 아래 GC 정산으로 그대로 반영하므로 시간 모델만 생략한다.
+	 * => 클로드 추측.. 아무튼 원본 LearnedFTL에서도 write latency 부분이 주석처리 되어 있음.
+	 *	cmd = (struct nand_cmd){
+	 *		.type = GC_IO, .cmd = NAND_NOP, .stime = nsecs_latest,
+	 *		.interleave_pci_dma = false, .ppa = &new_tp_ppa,
+	 *	};
+	 *	if (last_pg_in_wordline(conv_ftl, &new_tp_ppa)) {
+	 *		cmd.cmd = NAND_WRITE;
+	 *		cmd.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
+	 *	}
+	 *	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
+	 *	nsecs_latest = max(nsecs_completed, nsecs_latest);
+	 */
 
 	/* GTD 업데이트 */
-	conv_ftl->gtd[node->tp_idx] = new_tp_ppa;
+	conv_ftl->gtd[tp_idx] = new_tp_ppa;
 
 	*stime = nsecs_latest;
+
+	/*
+	 * TRANS_IO frontier도 물리 line을 소비하므로 user write(conv_write)와 동일하게
+	 * write credit으로 정산한다. 이렇게 해야 모든 free-line 소비자(user write + TP
+	 * writeback)가 같은 credit/GC로 reconcile되어 free line 고갈을 막는다.
+	 * (원본의 pool-centric GC trigger와 동일한 효과.)
+	 */
+	consume_write_credit(conv_ftl);
+	check_and_refill_write_credit(conv_ftl);
+}
+
+static void tp_writeback_node(struct conv_ftl *conv_ftl, struct tp_node *node, uint64_t *stime)
+{
+	tp_flush_idx(conv_ftl, node->tp_idx, node, stime);
 }
 
 static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
@@ -598,21 +902,98 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 	return tp_buf[entry_idx];
 }
 
+/*
+ * Try to answer a mapping lookup from the learned-index model instead of
+ * reading the translation page. The prediction is verified against the
+ * in-memory reverse map (no NAND access), so a wrong model never corrupts data.
+ * Returns true and sets *out on a verified hit.
+ */
+static bool model_predict(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *out)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t tp_idx = lpn / entries_per_tp(conv_ftl);
+	struct lr_node *node = &conv_ftl->lr_nodes[tp_idx];
+	uint64_t pred_lpn, pred, pred_pgidx;
+	struct ppa ppa;
+	int j, seg = -1;
+
+	atomic64_inc(&model_uses);
+
+	if (lpn < node->start_lpn)
+		return false;
+	pred_lpn = lpn - node->start_lpn;
+
+	for (j = 0; j < LR_MAX_INTERVALS; j++) {
+		if (pred_lpn <= node->brks[j].key) {
+			seg = j;
+			break;
+		}
+	}
+	if (seg < 0)
+		return false;
+
+	pred = lr_predict(pred_lpn, node->brks[seg].w_fp, node->brks[seg].b_fp);
+	pred_pgidx = node->start_ppa + pred;
+	if (pred_pgidx >= spp->tt_pgs)
+		return false;
+
+	ppa = pgidx2ppa(conv_ftl, pred_pgidx);
+	if (get_rmap_ent(conv_ftl, &ppa) == lpn) {
+		*out = ppa;
+		atomic64_inc(&model_hits);
+		return true;
+	}
+	return false;
+}
+
 static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
 {
 	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
-	if (e)
-		return e->ppa;
+	uint32_t ents = entries_per_tp(conv_ftl);
+	struct ppa *tp_buf =
+		(struct ppa *)(conv_ftl->tp_map + (size_t)(lpn / ents) * conv_ftl->ssd->sp.pgsz);
+	uint32_t tp_idx;
+	struct ppa pred;
+	struct ppa ppa;
 
-	/* CMT miss: translation page에서 읽어와서 캐싱 */
-	struct ppa ppa = tp_load(conv_ftl, lpn, stime);
+	if (e) {
+		/* ppa 정답은 항상 tp_map에서 읽는다(write-through라 늘 최신).
+		 * CMT hit이라고 e->ppa를 쓰지 않는다 — hit은 단지 "캐시에 있으니
+		 * translation page를 NAND에서 안 읽어도 된다(read 지연 면제)"는 의미일 뿐. */
+		return tp_buf[lpn % ents];
+	}
+
+	/* CMT miss: try the learned-index model before paying a translation read */
+	tp_idx = lpn / ents;
+	if (conv_ftl->bitmaps[lpn] && conv_ftl->lr_nodes[tp_idx].u &&
+	    model_predict(conv_ftl, lpn, &pred))
+		return pred;
+
+	/* prediction unavailable/failed: read translation page and cache it */
+	ppa = tp_load(conv_ftl, lpn, stime);
 	cmt_insert(conv_ftl, lpn, ppa, false, stime);
-	return ppa;
+
+	/* cmt_insert() may evict a dirty TP node, and that writeback (tp_flush_idx)
+	 * consumes a write credit which can trigger a foreground GC *re-entrantly*.
+	 * Such a GC can relocate THIS lpn and erase the page tp_load() just returned,
+	 * leaving `ppa` stale (now PG_FREE). tp_map is write-through and GC keeps it
+	 * current, so re-read it for the answer — otherwise conv_write would call
+	 * mark_page_invalid() on a freed page and trip its PG_VALID assert. */
+	return tp_buf[lpn % ents];
 }
 
 static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa, uint64_t *stime)
 {
-	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t ents = entries_per_tp(conv_ftl);
+	struct ppa *tp_buf = (struct ppa *)(conv_ftl->tp_map + (size_t)(lpn / ents) * spp->pgsz);
+	struct cmt_entry *e;
+
+	/* write-through: tp_map이 항상 최신인 매핑 정답지가 된다.
+	 * 이후 CMT dirty/writeback은 정합성이 아니라 순수 NAND write latency 모델용. */
+	tp_buf[lpn % ents] = ppa;
+
+	e = cmt_lookup(&conv_ftl->cmt, lpn);
 	if (e) {
 		e->ppa = ppa;
 		if (!e->dirty) {
@@ -624,6 +1005,23 @@ static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa
 
 	/* CMT miss: TP를 읽어올 필요 없이 바로 dirty로 삽입 */
 	cmt_insert(conv_ftl, lpn, ppa, true, stime);
+}
+
+/*
+ * GC 재배치 전용 매핑 갱신. tp_map(정답)을 write-through로 갱신하기만 한다.
+ * cmt_insert/evict를 절대 호출하지 않아 GC 도중의 writeback cascade(=free line
+ * 고갈의 원인)를 차단한다. 재배치된 매핑의 NAND 영속화는 do_gc 종료 시
+ * lr_train_collected의 tp_idx별 batched flush가 담당한다.
+ */
+static void dftl_set_ppa_gc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t ents = entries_per_tp(conv_ftl);
+	struct ppa *tp_buf = (struct ppa *)(conv_ftl->tp_map + (size_t)(lpn / ents) * spp->pgsz);
+
+	/* 매핑 정답은 tp_map 한 곳뿐이라 write-through만 하면 끝.
+	 * read는 CMT hit이어도 tp_map에서 읽으므로 GC가 캐시를 맞춰줄 필요가 없다. */
+	tp_buf[lpn % ents] = ppa;
 }
 
 static void init_rmap(struct conv_ftl *conv_ftl)
@@ -662,6 +1060,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	/* initialize write pointer, this is how we allocate new pages for writes */
 	prepare_write_pointer(conv_ftl, USER_IO);
 	prepare_write_pointer(conv_ftl, GC_IO);
+	prepare_write_pointer(conv_ftl, TRANS_IO);
 
 	init_write_flow_control(conv_ftl);
 
@@ -682,8 +1081,11 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 static void conv_init_params(struct convparams *cpp)
 {
 	cpp->op_area_pcent = OP_AREA_PERCENT;
-	cpp->gc_thres_lines = 2; /* Need only two lines.(host write, gc)*/
-	cpp->gc_thres_lines_high = 2; /* Need only two lines.(host write, gc)*/
+	/* host write 1 + GC 한 패스 최악 소비(재배치 vpc + TP batched flush K ≈ 2라인)를
+	 * 흡수하기 위한 예약. D-FTL은 GC가 TP write를 추가로 발생시키므로 conv 원본의
+	 * 2줄로는 부족해 free line이 고갈된다(NULL deref). */
+	cpp->gc_thres_lines = 4;
+	cpp->gc_thres_lines_high = 4;
 	cpp->enable_gc_delay = 1;
 	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100);
 }
@@ -878,10 +1280,21 @@ static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	int i;
 
 	for (i = 0; i < spp->pgs_per_blk; i++) {
+		struct ppa page_ppa = *ppa;
+
 		/* reset page status */
 		pg = &blk->pg[i];
 		NVMEV_ASSERT(pg->nsecs == spp->secs_per_pg);
 		pg->status = PG_FREE;
+
+		/* Erasing a block also clears its OOB, so drop the stale reverse-map
+		 * entry for every freed page. Otherwise rmap[pgidx] keeps pointing at
+		 * the lpn that used to live here, and the learned index's model_predict()
+		 * — which verifies a prediction solely via get_rmap_ent(ppa)==lpn — can
+		 * accept a freed page and hand it back to conv_write, tripping
+		 * NVMEV_ASSERT(pg->status == PG_VALID) in mark_page_invalid(). */
+		page_ppa.g.pg = i;
+		set_rmap_ent(conv_ftl, INVALID_LPN, &page_ppa);
 	}
 
 	/* reset block status */
@@ -916,9 +1329,11 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	struct convparams *cpp = &conv_ftl->cp;
 	struct ppa new_ppa;
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
+	/* translation page는 trans frontier로, 데이터는 GC frontier로 재배치 */
+	uint32_t io_type = (lpn >= TRANS_LPN_BASE) ? TRANS_IO : GC_IO;
 
 	//NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-	new_ppa = get_new_page(conv_ftl, GC_IO);
+	new_ppa = get_new_page(conv_ftl, io_type);
 	/* update maptbl */
 	//set_maptbl_ent(conv_ftl, lpn, &new_ppa);
 	/* update rmap */
@@ -927,16 +1342,25 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	mark_page_valid(conv_ftl, &new_ppa);
 
 	/* need to advance the write pointer here */
-	advance_write_pointer(conv_ftl, GC_IO);
+	advance_write_pointer(conv_ftl, io_type);
 
 	if (lpn >= TRANS_LPN_BASE) {
 		/* TP 내용물은 tp_idx 슬롯에 고정이라 복사 불필요, GTD만 갱신 */
 		uint32_t tp_idx = (uint32_t)(lpn - TRANS_LPN_BASE);
 		conv_ftl->gtd[tp_idx] = new_ppa;
 	} else {
-		uint64_t stime = 0;
 		NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-		dftl_set_ppa(conv_ftl, lpn, new_ppa, &stime);
+		/* GC 전용 경로: CMT insert/evict 없이 tp_map만 갱신 (cascade 차단).
+		 * 재배치 매핑은 tp_map(write-through)에 반영되고 모델 재학습으로 복원,
+		 * NAND 영속화는 trans frontier의 writeback이 담당. */
+		dftl_set_ppa_gc(conv_ftl, lpn, new_ppa);
+
+		/* collect (lpn, new pgidx) for learned-index training at GC end */
+		if (conv_ftl->gc_train_cnt < spp->pgs_per_line) {
+			int c = conv_ftl->gc_train_cnt++;
+			conv_ftl->gc_train_lpns[c] = lpn;
+			conv_ftl->gc_train_pgidxs[c] = ppa2pgidx(conv_ftl, &new_ppa);
+		}
 	}
 
 	if (cpp->enable_gc_delay) {
@@ -1014,14 +1438,72 @@ static void clean_one_block(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	NVMEV_ASSERT(get_blk(conv_ftl->ssd, ppa)->vpc == cnt);
 }
 
-/* here ppa identifies the block we want to clean */
-static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
+/*
+ * GC relocation helpers — LPN-sorted segment cleaning.
+ *
+ * The learned index fits lpn -> vPPN, and our pgidx is allocation-ordered, so a run of
+ * consecutive LPNs relocated back-to-back lands on consecutive vPPNs (a fittable straight
+ * line). To produce those runs, do_gc gathers the victim's data-page LPNs
+ * (gc_collect_flashpg), sorts them, and only then relocates via gc_relocate_data — instead
+ * of relocating in physical scan order, which scrambled lpn->vPPN and left the model almost
+ * no exact matches. (gc_write_page above is the old scan-order relocator, now unused.)
+ */
+
+/* Allocate a fresh page on the given frontier for `lpn`, mark it valid, advance the write
+ * pointer, and model the NAND program latency. Returns the new ppa. */
+static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn, uint32_t io_type)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct convparams *cpp = &conv_ftl->cp;
+	struct ppa new_ppa = get_new_page(conv_ftl, io_type);
+
+	set_rmap_ent(conv_ftl, lpn, &new_ppa);
+	mark_page_valid(conv_ftl, &new_ppa);
+	advance_write_pointer(conv_ftl, io_type);
+
+	if (cpp->enable_gc_delay) {
+		struct nand_cmd gcw = {
+			.type = GC_IO,
+			.cmd = NAND_NOP,
+			.stime = 0,
+			.interleave_pci_dma = false,
+			.ppa = &new_ppa,
+		};
+		if (last_pg_in_wordline(conv_ftl, &new_ppa)) {
+			gcw.cmd = NAND_WRITE;
+			gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
+		}
+		ssd_advance_nand(conv_ftl->ssd, &gcw);
+	}
+	return new_ppa;
+}
+
+/* Relocate one translation page (lpn encodes its tp_idx) to the TRANS frontier; the page
+ * content lives in tp_map[tp_idx], so only the GTD entry moves. */
+static void gc_relocate_tp(struct conv_ftl *conv_ftl, uint64_t lpn)
+{
+	struct ppa new_ppa = gc_alloc_and_write(conv_ftl, lpn, TRANS_IO);
+
+	conv_ftl->gtd[(uint32_t)(lpn - TRANS_LPN_BASE)] = new_ppa;
+}
+
+/* Relocate one data page to the GC frontier; tp_map is updated write-through. */
+static struct ppa gc_relocate_data(struct conv_ftl *conv_ftl, uint64_t lpn)
+{
+	struct ppa new_ppa = gc_alloc_and_write(conv_ftl, lpn, GC_IO);
+
+	dftl_set_ppa_gc(conv_ftl, lpn, new_ppa);
+	return new_ppa;
+}
+
+/* Collect phase for one flash page of the victim: account the batched read, relocate any
+ * translation pages immediately, and gather data-page LPNs for later LPN-sorted relocation. */
+static void gc_collect_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct convparams *cpp = &conv_ftl->cp;
 	struct nand_page *pg_iter = NULL;
 	int cnt = 0, i = 0;
-	uint64_t completed_time = 0;
 	struct ppa ppa_copy = *ppa;
 
 	for (i = 0; i < spp->pgs_per_flashpg; i++) {
@@ -1048,16 +1530,25 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 			.interleave_pci_dma = false,
 			.ppa = &ppa_copy,
 		};
-		completed_time = ssd_advance_nand(conv_ftl->ssd, &gcr);
+		ssd_advance_nand(conv_ftl->ssd, &gcr);
 	}
 
 	for (i = 0; i < spp->pgs_per_flashpg; i++) {
 		pg_iter = get_pg(conv_ftl->ssd, &ppa_copy);
 
-		/* there shouldn't be any free page in victim blocks */
 		if (pg_iter->status == PG_VALID) {
-			/* delay the maptbl update until "write" happens */
-			gc_write_page(conv_ftl, &ppa_copy);
+			uint64_t lpn = get_rmap_ent(conv_ftl, &ppa_copy);
+
+			if (lpn >= TRANS_LPN_BASE) {
+				/* translation page: relocate immediately */
+				gc_relocate_tp(conv_ftl, lpn);
+			} else {
+				/* data page: gather LPN; relocated in sorted order in do_gc */
+				NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
+				NVMEV_ASSERT(conv_ftl->gc_train_cnt <
+					     GC_BATCH_LINES * spp->pgs_per_line);
+				conv_ftl->gc_train_lpns[conv_ftl->gc_train_cnt++] = lpn;
+			}
 		}
 
 		ppa_copy.g.pg++;
@@ -1077,62 +1568,94 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 static int do_gc(struct conv_ftl *conv_ftl, bool force)
 {
-	struct line *victim_line = NULL;
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
-	int flashpg;
+	int flashpg, k, b;
+	int nlines = 0;
 
-	victim_line = select_victim_line(conv_ftl, force);
-	if (!victim_line) {
-		return -1;
-	}
+	conv_ftl->gc_train_cnt = 0;
+	conv_ftl->wfc.credits_to_refill = 0;
 
-	ppa.g.blk = victim_line->id;
-	NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-			    victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
-			    conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+	/*
+	 * Stage A — batch up to GC_BATCH_LINES victim lines: relocate translation pages
+	 * immediately, gather data-page LPNs into the shared buffer, and erase + free each
+	 * victim right away so its space becomes reusable for the relocation below. Pooling
+	 * several lines' data before the LPN sort lengthens the per-translation-page runs
+	 * (segment cleaning), so the learned index fits across line boundaries.
+	 */
+	for (b = 0; b < GC_BATCH_LINES; b++) {
+		struct line *victim_line = select_victim_line(conv_ftl, force);
 
-	conv_ftl->wfc.credits_to_refill = victim_line->ipc;
+		if (!victim_line)
+			break;
 
-	/* copy back valid data */
-	for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++) {
-		int ch, lun;
+		ppa.g.blk = victim_line->id;
+		conv_ftl->wfc.credits_to_refill += victim_line->ipc;
+		atomic64_inc(&gc_runs);
+		nlines++;
 
-		ppa.g.pg = flashpg * spp->pgs_per_flashpg;
-		for (ch = 0; ch < spp->nchs; ch++) {
-			for (lun = 0; lun < spp->luns_per_ch; lun++) {
-				struct nand_lun *lunp;
+		for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++) {
+			int ch, lun;
 
-				ppa.g.ch = ch;
-				ppa.g.lun = lun;
-				ppa.g.pl = 0;
-				lunp = get_lun(conv_ftl->ssd, &ppa);
-				clean_one_flashpg(conv_ftl, &ppa);
+			ppa.g.pg = flashpg * spp->pgs_per_flashpg;
+			for (ch = 0; ch < spp->nchs; ch++) {
+				for (lun = 0; lun < spp->luns_per_ch; lun++) {
+					struct nand_lun *lunp;
 
-				if (flashpg == (spp->flashpgs_per_blk - 1)) {
-					struct convparams *cpp = &conv_ftl->cp;
+					ppa.g.ch = ch;
+					ppa.g.lun = lun;
+					ppa.g.pl = 0;
+					lunp = get_lun(conv_ftl->ssd, &ppa);
+					gc_collect_flashpg(conv_ftl, &ppa);
 
-					mark_block_free(conv_ftl, &ppa);
+					if (flashpg == (spp->flashpgs_per_blk - 1)) {
+						struct convparams *cpp = &conv_ftl->cp;
 
-					if (cpp->enable_gc_delay) {
-						struct nand_cmd gce = {
-							.type = GC_IO,
-							.cmd = NAND_ERASE,
-							.stime = 0,
-							.interleave_pci_dma = false,
-							.ppa = &ppa,
-						};
-						ssd_advance_nand(conv_ftl->ssd, &gce);
+						mark_block_free(conv_ftl, &ppa);
+
+						if (cpp->enable_gc_delay) {
+							struct nand_cmd gce = {
+								.type = GC_IO,
+								.cmd = NAND_ERASE,
+								.stime = 0,
+								.interleave_pci_dma = false,
+								.ppa = &ppa,
+							};
+							ssd_advance_nand(conv_ftl->ssd, &gce);
+						}
+
+						lunp->gc_endtime = lunp->next_lun_avail_time;
 					}
-
-					lunp->gc_endtime = lunp->next_lun_avail_time;
 				}
 			}
 		}
+
+		/* free this victim now so Stage C can relocate into its reclaimed space */
+		mark_line_free(conv_ftl, &ppa);
 	}
 
-	/* update line status */
-	mark_line_free(conv_ftl, &ppa);
+	if (nlines == 0)
+		return -1;
+
+	/*
+	 * Stage B — sort the whole batch's data LPNs ascending. Relocating in this order makes
+	 * each translation-page group a monotonically increasing vPPN run, which the learned
+	 * index fits with far more exact matches. gc_train_pgidxs is (re)written in Stage C, so
+	 * its values here are a don't-care that the pair-sort merely carries along.
+	 */
+	if (conv_ftl->gc_train_cnt > 1)
+		lr_sort_pairs(conv_ftl->gc_train_lpns, conv_ftl->gc_train_pgidxs, 0,
+			      conv_ftl->gc_train_cnt - 1);
+
+	/* Stage C — relocate data pages in LPN order; record (lpn, new vPPN) for training. */
+	for (k = 0; k < conv_ftl->gc_train_cnt; k++) {
+		struct ppa new_ppa = gc_relocate_data(conv_ftl, conv_ftl->gc_train_lpns[k]);
+
+		conv_ftl->gc_train_pgidxs[k] = ppa2pgidx(conv_ftl, &new_ppa);
+	}
+
+	/* Stage D — train learned-index models on the LPN-sorted (cross-line) runs. */
+	lr_train_collected(conv_ftl);
 
 	return 0;
 }

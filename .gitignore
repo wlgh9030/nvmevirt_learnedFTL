@@ -171,3 +171,6 @@ sphinx_*/
 
 # Local makefile
 Makefile.local
+
+# fio verify-state artifacts (test_ftl.sh runner output)
+*.state

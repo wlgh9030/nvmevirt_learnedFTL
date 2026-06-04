@@ -35,6 +35,7 @@ enum {
 enum {
 	USER_IO = 0,
 	GC_IO = 1,
+	TRANS_IO = 2, /* translation page writeback frontier (separate from data) */
 };
 
 enum {
