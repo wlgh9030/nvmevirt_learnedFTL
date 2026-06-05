@@ -342,6 +342,12 @@ static int __proc_file_read(struct seq_file *m, void *data)
 			   total_io);
 	} else if (strcmp(filename, "debug") == 0) {
 		/* Left for later use */
+	} else if (strcmp(filename, "cmt_stat") == 0) {
+		uint64_t access = 0, hit = 0, miss = 0;
+
+		conv_cmt_stat_read(&access, &hit, &miss);
+		seq_printf(m, "access %llu hit %llu miss %llu\n", (unsigned long long)access,
+			   (unsigned long long)hit, (unsigned long long)miss);
 	}
 
 	return 0;
@@ -392,6 +398,9 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 		}
 	} else if (!strcmp(filename, "debug")) {
 		/* Left for later use */
+	} else if (!strcmp(filename, "cmt_stat")) {
+		/* any write resets per-phase CMT and LR model hit counters */
+		conv_cmt_stat_reset();
 	}
 
 out:
@@ -448,6 +457,8 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
+	/* writable: cat to check CMT access/hit/miss, echo anything to reset read-path counters */
+	proc_create("cmt_stat", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 }
 
 static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
@@ -457,6 +468,7 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 	remove_proc_entry("io_units", nvmev_vdev->proc_root);
 	remove_proc_entry("stat", nvmev_vdev->proc_root);
 	remove_proc_entry("debug", nvmev_vdev->proc_root);
+	remove_proc_entry("cmt_stat", nvmev_vdev->proc_root);
 
 	remove_proc_entry("nvmev", NULL);
 

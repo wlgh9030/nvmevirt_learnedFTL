@@ -27,11 +27,23 @@
 #define LR_TRAIN_THRESHOLD 30 /* min samples in a TP group to train a model */
 #define LR_FP_SHIFT 16 /* fixed-point fractional bits (kernel has no FPU) */
 #define GC_BATCH_LINES 4 /* victim lines batched per do_gc for segment cleaning */
+/* WA control for whole-group GC: a group earns a one-sweep whole-group compaction
+ * (contiguous LPN-sorted relocation) only once it holds at least this many lines'
+ * worth of invalid pages; below it, do_gc uses efficient global lowest-vpc victims.
+ * Raise to cut write-amplification (fewer, riper sweeps) at some learned-index
+ * coverage; lower toward 0 for max coverage (every most-invalid group swept). */
+#define GROUP_GC_MIN_INVALID_LINES \
+	0 /* 2,4: unreachable for ~1-line groups (TP=8) under light random overwrite
+	   * (~630 invalid/group « pgs_per_line), so whole-group sweep never fired (group_gc=0,
+	   * all fallback). 0 = sweep the most-invalid group whenever do_gc runs → faithful
+	   * LearnedFTL LPN-sorted group relocation engages. Trade: relocates lightly-invalid
+	   * groups (WA↑). */
 
 /* GTD-entry grouping for group-granular GC (LearnedFTL). A group owns
  * TP_PER_GROUP consecutive translation pages; group_of(lpn) =
  * (lpn / entries_per_tp) / TP_PER_GROUP. */
-#define TP_PER_GROUP 64
+#define TP_PER_GROUP \
+	8 /* group = 8 TP = 16MB = exactly 1 line: strict 1-line-1-group, light per-event GC */
 #define GROUP_NONE (-1) /* line/wp not owned by a data group (gc/trans frontier) */
 
 /* one piecewise-linear segment: pgidx ~= (w_fp*x + b_fp) >> LR_FP_SHIFT, x = lpn - start_lpn */
@@ -130,8 +142,8 @@ struct line_mgmt {
 };
 
 struct write_flow_control {
-	uint32_t write_credits;
-	uint32_t credits_to_refill;
+	int64_t write_credits;
+	int64_t credits_to_refill;
 };
 
 /* per-group accounting for group-granular GC (LearnedFTL).
@@ -140,6 +152,7 @@ struct write_flow_control {
 struct gtd_group {
 	uint32_t valid_pages; /* live DATA pages whose lpn maps into this group */
 	uint32_t invalid_pages; /* invalid DATA pages in this group's lines (== sum of owned-line ipc) */
+	uint32_t alloc_lines; /* lines this group currently owns (LearnedFTL cumulative_allocated_blocks) */
 };
 
 struct conv_ftl {
@@ -186,5 +199,9 @@ void conv_remove_namespace(struct nvmev_ns *ns);
 
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 			   struct nvmev_result *ret);
+
+/* Read-path hit counters, surfaced/reset via /proc/nvmev/cmt_stat */
+void conv_cmt_stat_read(uint64_t *access, uint64_t *hit, uint64_t *miss);
+void conv_cmt_stat_reset(void);
 
 #endif

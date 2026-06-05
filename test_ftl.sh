@@ -4,18 +4,94 @@
 #   - learnedFTL 효과 측정: 순차 쓰기로 모델 학습 유발 후 랜덤 읽기로 예측 경로 가동
 #
 # 주의: raw 디바이스에 직접 쓰므로 $DEV 의 내용은 모두 지워집니다 (테스트 전용).
-# 사용법: ./test_ftl.sh [bug-seq | bug-rand | bug-rw | learned | all]
+# 사용법: ./test_ftl.sh [bug-seq | bug-rand | bug-rw | learned | paper-randread | paper-seqread | paper-read | all]
 set -u
 
 DEV=/dev/nvme2n1
 KO=./nvmev.ko
-MEMMAP="memmap_start=4G memmap_size=4G cpus=14,15"
+MEMMAP="memmap_start=4G memmap_size=8G cpus=14,15"   # 8GB device; verify boot `memmap=` reserves 4G..12G
 SIZE=3G          # 디바이스보다 작게 (OP 제외 ~3.7G). GC 유발은 loops 로.
 COMMON="--filename=$DEV --ioengine=io_uring --direct=1 --group_reporting"
+PAPER_THREADS=64
+PAPER_BS=4k
+PAPER_WARMUP_LOOPS=6
+PAPER_WARMUP_COMMON="--filename=$DEV --ioengine=psync --direct=1 --group_reporting --bs=$PAPER_BS --iodepth=1"
+PAPER_READ_COMMON="--filename=$DEV --ioengine=psync --direct=1 --group_reporting --thread --numjobs=$PAPER_THREADS --bs=$PAPER_BS --iodepth=1"
 
 load()   { sudo dmesg -C; sudo insmod $KO $MEMMAP || exit 1; sleep 1; }
-stats()  { sudo dmesg | grep -E "NVMeVirt: (CMT|LR model)" | tail -2; }
-unload() { echo "----- stats -----"; stats; sudo rmmod nvmev; echo; }
+stats() {
+  sudo dmesg | grep -E "NVMeVirt: (CMT|LR model|GC diag|WA)" | tail -4
+  sudo dmesg | awk '
+    /NVMeVirt: CMT / {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^hits=/) {
+          split($i, a, "=");
+          cmt_hits = a[2] + 0;
+        } else if ($i ~ /^misses=/) {
+          split($i, a, "=");
+          cmt_misses = a[2] + 0;
+        }
+      }
+    }
+    /NVMeVirt: LR model/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^uses=/) {
+          split($i, a, "=");
+          model_uses = a[2] + 0;
+        } else if ($i ~ /^hits=/) {
+          split($i, a, "=");
+          model_hits = a[2] + 0;
+        }
+      }
+    }
+    END {
+      cmt_access = cmt_hits + cmt_misses;
+      if (cmt_access > 0) {
+        printf "Fig14 ratios: CMT hit %.2f%%, Model hit %.2f%% of CMT misses, Combined %.2f%% of reads\n",
+          cmt_hits * 100.0 / cmt_access,
+          cmt_misses ? model_hits * 100.0 / cmt_misses : 0,
+          (cmt_hits + model_hits) * 100.0 / cmt_access;
+      }
+      if (model_uses > 0) {
+        printf "LR verify ratio: %.2f%% (hits %.0f / uses %.0f)\n",
+          model_hits * 100.0 / model_uses, model_hits, model_uses;
+      }
+    }'
+}
+unload() { sudo rmmod nvmev; echo "----- stats -----"; stats; echo; }
+
+paper_range_bytes() {
+  local devb=$1
+  local range
+
+  range=$((devb / PAPER_THREADS / 4096 * 4096))
+  if [ "$range" -le 0 ]; then
+    echo "ERROR: $DEV is too small for PAPER_THREADS=$PAPER_THREADS" >&2
+    exit 1
+  fi
+
+  echo "$range"
+}
+
+reset_read_cmt_stat() {
+  if [ -e /proc/nvmev/cmt_stat ]; then
+    echo 1 | sudo tee /proc/nvmev/cmt_stat >/dev/null
+  fi
+}
+
+show_read_cmt_stat() {
+  echo "----- read-phase CMT stat -----"
+  if [ -e /proc/nvmev/cmt_stat ]; then
+    sudo awk '{
+      if ($2 > 0)
+        printf "%s (CMT hit ratio %.2f%%)\n", $0, ($4 * 100.0 / $2);
+      else
+        printf "%s (CMT hit ratio n/a)\n", $0;
+    }' /proc/nvmev/cmt_stat
+  else
+    echo "WARN: /proc/nvmev/cmt_stat not found"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # 1) 정합성 — 순차 write 후 자동 verify read (가장 기본적인 매핑 깨짐 탐지)
@@ -68,8 +144,8 @@ learned() {
   load
   local DEVB SZ OW
   DEVB=$(sudo blockdev --getsize64 $DEV)
-  SZ=$((DEVB * 92 / 100))   # 거의 꽉 채워 GC 압박 ↑ (OP 여유는 조금)
-  OW=$((DEVB * 25 / 100))   # free 공간보다 크게 overwrite → GC 확실 유발, victim 은 다수 valid 유지
+  SZ=$((DEVB * 90 / 100))   # GC 압박은 유지하되 OP 여유를 조금 더 둠
+  OW=$((DEVB * 20 / 100))   # free 공간보다 크게 overwrite → GC 유발, victim 은 다수 valid 유지
   echo "-- dev=$DEVB  fill=$SZ  overwrite=$OW (bytes)"
   echo "-- phase1: sequential fill"
   sudo fio --name=seq_fill $COMMON --rw=write --bs=128k --size=$SZ --iodepth=32
@@ -79,15 +155,65 @@ learned() {
   echo "-- phase3: random read (CMT miss -> 예측 경로)"
   sudo fio --name=rand_read $COMMON --rw=randread --bs=4k --size=$SZ --iodepth=32 
   echo "-- 결과 (LR hits / GC diag 확인):"
-  stats
-  sudo rmmod nvmev; echo
+  unload
 }
 
+# ---------------------------------------------------------------------------
+# 5) Fig. 14(b) 논문 조건: stable-state warm-up 후 4KB / psync / 64 threads read.
+#    - RandRead: random write로 전체 SSD를 약 6회 warm-up 후 randread
+#    - SeqRead : sequential write로 전체 SSD를 약 6회 warm-up 후 read
+#    warm-up은 단일 stream으로 전체 SSD를 6회 쓴다. 특히 sequential warm-up을
+#    64개 disjoint stream으로 만들면 SI의 contiguous run이 깨져 model coverage가
+#    낮아진다. read phase만 64 threads를 사용한다.
+paper_read_workload() {
+  local name=$1
+  local warm_rw=$2
+  local read_rw=$3
+  local DEVB RANGE COVER r
+
+  echo "### [paper-$name] Fig. 14(b): $warm_rw warm-up -> $read_rw"
+  load
+
+  DEVB=$(sudo blockdev --getsize64 $DEV)
+  RANGE=$(paper_range_bytes "$DEVB")
+  COVER=$((RANGE * PAPER_THREADS))
+  echo "-- dev=$DEVB bytes, covered=$COVER bytes, per_thread_range=$RANGE bytes"
+  echo "-- warm-up: rw=$warm_rw bs=$PAPER_BS ioengine=psync threads=1 loops=$PAPER_WARMUP_LOOPS"
+  sudo fio --name="${name}_warmup" $PAPER_WARMUP_COMMON --rw="$warm_rw" \
+      --size="$COVER" --loops="$PAPER_WARMUP_LOOPS"
+  r=$?
+  if [ $r -ne 0 ]; then
+    echo "FAIL($r): warm-up fio failed"
+    unload
+    return $r
+  fi
+
+  echo "-- reset read-path hit counters before read benchmark"
+  reset_read_cmt_stat
+
+  echo "-- read benchmark: rw=$read_rw bs=$PAPER_BS ioengine=psync threads=$PAPER_THREADS"
+  sudo fio --name="${name}_read" $PAPER_READ_COMMON --rw="$read_rw" \
+      --size="$RANGE" --offset_increment="$RANGE" --loops=1
+  r=$?
+
+  show_read_cmt_stat
+  echo "-- unload log below prints LR model uses/hits for model hit check"
+  unload
+  return $r
+}
+
+paper_randread() { paper_read_workload "randread" "randwrite" "randread"; }
+paper_seqread()  { paper_read_workload "seqread"  "write"     "read"; }
+paper_read()     { paper_randread && paper_seqread; }
+
 case "${1:-all}" in
-  bug-seq)  bug_seq ;;
-  bug-rand) bug_rand ;;
-  bug-rw)   bug_rw ;;
-  learned)  learned ;;
-  all)      bug_seq; bug_rand; bug_rw; learned ;;
-  *) echo "usage: $0 [bug-seq|bug-rand|bug-rw|learned|all]"; exit 1 ;;
+  bug-seq)        bug_seq ;;
+  bug-rand)       bug_rand ;;
+  bug-rw)         bug_rw ;;
+  learned)        learned ;;
+  paper-randread) paper_randread ;;
+  paper-seqread)  paper_seqread ;;
+  paper-read)     paper_read ;;
+  all)            bug_seq; bug_rand; bug_rw; learned ;;
+  *) echo "usage: $0 [bug-seq|bug-rand|bug-rw|learned|paper-randread|paper-seqread|paper-read|all]"; exit 1 ;;
 esac

@@ -70,13 +70,14 @@ enum {
 #define MDTS (6)
 #define CELL_MODE (CELL_MODE_MLC)
 
-#define SSD_PARTITIONS (4)
+#define SSD_PARTITIONS (1) // single FTL: 8GB config keeps 1 line == 1 group (16MB)
 #define NAND_CHANNELS (8)
 #define LUNS_PER_NAND_CH (2)
 #define PLNS_PER_LUN (1)
 #define FLASH_PAGE_SIZE KB(32)
 #define ONESHOT_PAGE_SIZE (FLASH_PAGE_SIZE * 1)
-#define BLKS_PER_PLN (256) // GC 보려고 줄임 (virt에 4GB정도 할당)(8192)
+#define BLKS_PER_PLN \
+	(512) // 8GB total with 16MB lines (1 line == 1 group)
 #define BLK_SIZE (0) /*BLKS_PER_PLN should not be 0 */
 static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 
@@ -100,10 +101,13 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define FW_WBUF_LATENCY0 (4000)
 #define FW_WBUF_LATENCY1 (460)
 #define FW_CH_XFER_LATENCY (0)
-#define OP_AREA_PERCENT (0.07)
+#define OP_AREA_PERCENT \
+	(0.30) // 1-line-1-group (num_groups==tt_lines): each touched group holds an open frontier line, so need ample free-line slack; tunable
 
-#define GLOBAL_WB_SIZE (NAND_CHANNELS * LUNS_PER_NAND_CH * ONESHOT_PAGE_SIZE * 2)
-#define WRITE_EARLY_COMPLETION 0
+#define GLOBAL_WB_SIZE                                          \
+	(NAND_CHANNELS * LUNS_PER_NAND_CH * ONESHOT_PAGE_SIZE * \
+	 16) // ×8 of orig 1MB (=8MB): hold partial oneshot-wordlines for many per-group frontiers under random writes (TP_PER_GROUP=8)
+#define WRITE_EARLY_COMPLETION 1
 
 #define LBA_BITS (9)
 #define LBA_SIZE (1 << LBA_BITS)

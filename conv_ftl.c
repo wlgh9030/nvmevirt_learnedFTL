@@ -27,6 +27,30 @@ static atomic64_t gc_groups = ATOMIC64_INIT(0);
 static atomic64_t gc_group_targeted =
 	ATOMIC64_INIT(0); /* do_gc passes that targeted a real group */
 static atomic64_t gc_fallback = ATOMIC64_INIT(0); /* do_gc passes that fell back to global victim */
+static atomic64_t host_writes = ATOMIC64_INIT(
+	0); /* host data page writes; WA = (host_writes + gc_reloc_pages) / host_writes */
+
+/* Runtime read-path counters for /proc/nvmev/cmt_stat. access = CMT hit + miss.
+ * Reading reports CMT stats; writing resets the per-phase CMT and LR model use/hit
+ * counters so one benchmark phase can be measured in isolation. These touch only
+ * diagnostic counters, so they never affect mapping/GC behavior. */
+void conv_cmt_stat_read(uint64_t *access, uint64_t *hit, uint64_t *miss)
+{
+	uint64_t h = atomic64_read(&cmt_hits);
+	uint64_t m = atomic64_read(&cmt_misses);
+
+	*hit = h;
+	*miss = m;
+	*access = h + m;
+}
+
+void conv_cmt_stat_reset(void)
+{
+	atomic64_set(&cmt_hits, 0);
+	atomic64_set(&cmt_misses, 0);
+	atomic64_set(&model_uses, 0);
+	atomic64_set(&model_hits, 0);
+}
 
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -168,6 +192,7 @@ static inline void consume_write_credit(struct conv_ftl *conv_ftl)
 }
 
 static void foreground_gc(struct conv_ftl *conv_ftl);
+static int do_gc(struct conv_ftl *conv_ftl, bool force);
 
 static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 {
@@ -268,24 +293,38 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 	return NULL;
 }
 
-static void prepare_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer *wp, int group)
+/* Lazy allocation: give wp a fresh line only when it has none (curline == NULL); wp->group
+ * is set once at init and the grabbed line is tagged with it. Every get_new_page() caller
+ * must call this first. Lazy (vs eager-at-init) is required under group==line geometry where
+ * num_groups == num_lines: an idle or full group then pins no open line. */
+static void ensure_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer *wp, bool gc_flag)
 {
-	struct line *curline = get_next_free_line(conv_ftl);
+	struct line *curline;
 
-	NVMEV_ASSERT(wp);
+	if (wp->curline)
+		return;
+
+	/* ld-tpftl init_line_write_pointer: grab a fresh line only AFTER reclaiming when the
+	 * free list is low. gc_flag=true (user writes) reclaims first so allocation never hits
+	 * an empty free list under many open per-group frontiers; gc_flag=false (GC relocation,
+	 * trans writeback) must NOT re-enter do_gc. do_gc reclaims a GC_BATCH_LINES batch, so a
+	 * single call jumps free_line_cnt back above the threshold. */
+	if (gc_flag && conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines)
+		do_gc(conv_ftl, true);
+
+	curline = get_next_free_line(conv_ftl);
 	NVMEV_ASSERT(curline);
-
-	curline->group = group;
-	/* wp->curline is always our next-to-write super-block */
-	*wp = (struct write_pointer){
-		.curline = curline,
-		.ch = 0,
-		.lun = 0,
-		.pg = 0,
-		.blk = curline->id,
-		.pl = 0,
-		.group = group,
-	};
+	curline->group = wp->group;
+	/* per-group owned-line accounting (LearnedFTL cumulative_allocated_blocks): only data
+	 * groups are counted; gc/trans frontiers are GROUP_NONE and don't drive group GC. */
+	if (wp->group != GROUP_NONE)
+		conv_ftl->groups[wp->group].alloc_lines++;
+	wp->curline = curline;
+	wp->ch = 0;
+	wp->lun = 0;
+	wp->pg = 0;
+	wp->blk = curline->id;
+	wp->pl = 0;
 }
 
 static void advance_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer *wpp)
@@ -336,28 +375,11 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, struct write_pointe
 		pqueue_insert(lm->victim_line_pq, wpp->curline);
 		lm->victim_line_cnt++;
 	}
-	/* current line is used up, pick another empty line */
-	check_addr(wpp->blk, spp->blks_per_pl);
-	wpp->curline = get_next_free_line(conv_ftl);
-	if (!wpp->curline) {
-		/* 최후보루: 예약(gc_thres_lines)이 충분하면 정상 운용에선 도달 불가.
-		 * 진짜 free line 고갈 시 주소 0 역참조 패닉 대신 로그만 남기고 빠진다. */
-		NVMEV_ERROR("%s: no free line left — device full, write pointer not advanced\n",
-			    __func__);
-		return;
-	}
-	wpp->curline->group = wpp->group; /* this frontier now owns the new line */
-	NVMEV_DEBUG_VERBOSE("wpp: got new clean line %d\n", wpp->curline->id);
-
-	wpp->blk = wpp->curline->id;
-	check_addr(wpp->blk, spp->blks_per_pl);
-
-	/* make sure we are starting from page 0 in the super block */
-	NVMEV_ASSERT(wpp->pg == 0);
-	NVMEV_ASSERT(wpp->lun == 0);
-	NVMEV_ASSERT(wpp->ch == 0);
-	/* TODO: assume # of pl_per_lun is 1, fix later */
-	NVMEV_ASSERT(wpp->pl == 0);
+	/* lazy frontier: the full line was sealed above; don't grab a new one here. The next
+	 * ensure_write_pointer() grabs one when this frontier is next written, so an idle or
+	 * full group holds no open line — required when num_groups == num_lines (group==line). */
+	wpp->curline = NULL;
+	return;
 out:
 	NVMEV_DEBUG_VERBOSE("advanced wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d (curline %d)\n",
 			    wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
@@ -619,11 +641,12 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 	conv_ftl->groups = vzalloc(sizeof(struct gtd_group) * conv_ftl->num_groups);
 	conv_ftl->group_wp = vmalloc(sizeof(struct write_pointer) * conv_ftl->num_groups);
 
-	/* free-line reserve must cover every open frontier (num_groups user + gc +
-	 * trans) plus GC's own destination line, else a write burst drains the free
-	 * list and advance_write_pointer NULL-derefs (see group-based-gc-port notes). */
-	conv_ftl->cp.gc_thres_lines = conv_ftl->num_groups + 4;
-	conv_ftl->cp.gc_thres_lines_high = conv_ftl->num_groups + 4;
+	/* free-line reserve (lazy-frontier / group==line model): GC keeps ~this many lines
+	 * free. NOT num_groups (== tt_lines here, which would exceed the device). With lazy
+	 * frontiers an idle/full group pins no open line, so a modest reserve suffices; raise
+	 * it or OP_AREA_PERCENT if random-write open-frontier spikes drain the free list. */
+	conv_ftl->cp.gc_thres_lines = 128;
+	conv_ftl->cp.gc_thres_lines_high = 128;
 
 	NVMEV_INFO("FTL geometry: tt_pgs=%ld tt_lines=%d pgs_per_line=%d ents_per_tp=%u "
 		   "num_tp=%u TP_PER_GROUP=%d num_groups=%u frontiers=%u reserve=%u\n",
@@ -713,10 +736,9 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 		   wb ? (wb_entries * 100 / wb) % 100 : 0);
 
 	NVMEV_INFO("LR model[%s]: trains=%lld bits_set=%lld uses=%lld hits=%lld si_installs=%lld\n",
-		   LEARNED_INDEX_ENABLE ? "ON" : "OFF",
-		   atomic64_read(&model_trains), atomic64_read(&model_bits_set),
-		   atomic64_read(&model_uses), atomic64_read(&model_hits),
-		   atomic64_read(&si_installs));
+		   LEARNED_INDEX_ENABLE ? "ON" : "OFF", atomic64_read(&model_trains),
+		   atomic64_read(&model_bits_set), atomic64_read(&model_uses),
+		   atomic64_read(&model_hits), atomic64_read(&si_installs));
 
 	NVMEV_INFO("GC diag: runs=%lld reloc_pages=%lld groups=%lld under_thresh=%lld "
 		   "group_gc=%lld fallback_gc=%lld\n",
@@ -724,6 +746,16 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 		   atomic64_read(&gc_groups),
 		   atomic64_read(&gc_groups) - atomic64_read(&model_trains),
 		   atomic64_read(&gc_group_targeted), atomic64_read(&gc_fallback));
+
+	{
+		uint64_t hw = atomic64_read(&host_writes);
+		uint64_t rl = atomic64_read(&gc_reloc_pages);
+		uint64_t wa100 = hw ? (hw + rl) * 100 / hw : 100;
+
+		NVMEV_INFO("WA: host_writes=%llu gc_reloc_pages=%llu WA=%llu.%02llu\n",
+			   (unsigned long long)hw, (unsigned long long)rl,
+			   (unsigned long long)(wa100 / 100), (unsigned long long)(wa100 % 100));
+	}
 
 	vfree(conv_ftl->gtd);
 	vfree(conv_ftl->tp_map);
@@ -840,7 +872,9 @@ static void tp_flush_idx(struct conv_ftl *conv_ftl, uint32_t tp_idx, struct tp_n
 	if (node)
 		atomic64_add(node->dirty_count, &tp_writeback_entries_total);
 
-	/* 새 페이지 할당 — translation page 전용 frontier(trans_wp)에 쓴다 */
+	/* 새 페이지 할당 — translation page 전용 frontier(trans_wp)에 쓴다.
+	 * gc_flag=false: CMT eviction에 중첩될 수 있는 경로라 do_gc 재진입 차단 */
+	ensure_write_pointer(conv_ftl, &conv_ftl->trans_wp, false);
 	new_tp_ppa = get_new_page(conv_ftl, &conv_ftl->trans_wp);
 	mark_page_valid(conv_ftl, &new_tp_ppa);
 	advance_write_pointer(conv_ftl, &conv_ftl->trans_wp);
@@ -1206,8 +1240,7 @@ static void si_update(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
 			conv_ftl->lr_nodes[lpn / ents].cover_len--;
 	}
 
-	if (conv_ftl->si_run_len &&
-	    lpn == conv_ftl->si_run_start_lpn + conv_ftl->si_run_len &&
+	if (conv_ftl->si_run_len && lpn == conv_ftl->si_run_start_lpn + conv_ftl->si_run_len &&
 	    pgidx == conv_ftl->si_run_start_pgidx + conv_ftl->si_run_len &&
 	    lpn / ents == conv_ftl->si_run_start_lpn / ents) {
 		conv_ftl->si_run_len++;
@@ -1307,16 +1340,18 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	/* initialize all the lines */
 	init_lines(conv_ftl);
 
-	/* initialize write pointers: one user frontier per group, plus the shared
-	 * GC and translation frontiers (eager init — reserve covers all of them) */
+	/* initialize write pointers LAZILY: record each frontier's owning group but grab no
+	 * line yet (curline == NULL); ensure_write_pointer() grabs one on first write. Under
+	 * group==line geometry num_groups == num_lines, so eager init would pin every line. */
 	{
 		uint32_t g;
 
 		for (g = 0; g < conv_ftl->num_groups; g++)
-			prepare_write_pointer(conv_ftl, &conv_ftl->group_wp[g], g);
+			conv_ftl->group_wp[g] =
+				(struct write_pointer){ .curline = NULL, .group = (int)g };
 	}
-	prepare_write_pointer(conv_ftl, &conv_ftl->gc_wp, GROUP_NONE);
-	prepare_write_pointer(conv_ftl, &conv_ftl->trans_wp, GROUP_NONE);
+	conv_ftl->gc_wp = (struct write_pointer){ .curline = NULL, .group = GROUP_NONE };
+	conv_ftl->trans_wp = (struct write_pointer){ .curline = NULL, .group = GROUP_NONE };
 
 	init_write_flow_control(conv_ftl);
 
@@ -1704,18 +1739,30 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 	return victim_line;
 }
 
-/* Pick the data group with the most invalid pages (reclaimable garbage). Returns
- * GROUP_NONE if no group has any. invalid_pages == sum of the group's owned-line
- * ipc, so this directly targets the group with the most to reclaim. */
+/* Pick the data group with the most reclaimable invalid pages. Only sealed
+ * victim lines (pos != 0) are reclaimable here; open frontier lines can have
+ * invalid pages in groups[].invalid_pages, but do_gc cannot select them yet. */
 static int pick_most_invalid_group(struct conv_ftl *conv_ftl)
 {
+	struct line_mgmt *lm = &conv_ftl->lm;
 	uint32_t g;
 	int best = GROUP_NONE;
 	uint32_t best_ipc = 0;
 
 	for (g = 0; g < conv_ftl->num_groups; g++) {
-		if (conv_ftl->groups[g].invalid_pages > best_ipc) {
-			best_ipc = conv_ftl->groups[g].invalid_pages;
+		uint32_t i;
+		uint32_t reclaimable_ipc = 0;
+
+		for (i = 0; i < lm->tt_lines; i++) {
+			struct line *ln = &lm->lines[i];
+
+			if (ln->pos == 0 || ln->group != (int)g)
+				continue;
+			reclaimable_ipc += (uint32_t)ln->ipc;
+		}
+
+		if (reclaimable_ipc > best_ipc) {
+			best_ipc = reclaimable_ipc;
 			best = (int)g;
 		}
 	}
@@ -1790,15 +1837,19 @@ static void clean_one_block(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 /* Allocate a fresh page on the given frontier for `lpn`, mark it valid, advance the write
  * pointer, and model the NAND program latency. Returns the new ppa. */
-static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn, uint32_t io_type)
+static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn,
+				     struct write_pointer *wp)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct convparams *cpp = &conv_ftl->cp;
-	struct ppa new_ppa = get_new_page(conv_ftl, __get_wp(conv_ftl, io_type));
+	struct ppa new_ppa;
 
+	/* gc_flag=false: this IS the GC relocation path — must not re-enter do_gc */
+	ensure_write_pointer(conv_ftl, wp, false);
+	new_ppa = get_new_page(conv_ftl, wp);
 	set_rmap_ent(conv_ftl, lpn, &new_ppa);
 	mark_page_valid(conv_ftl, &new_ppa);
-	advance_write_pointer(conv_ftl, __get_wp(conv_ftl, io_type));
+	advance_write_pointer(conv_ftl, wp);
 
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
@@ -1821,15 +1872,18 @@ static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn, ui
  * content lives in tp_map[tp_idx], so only the GTD entry moves. */
 static void gc_relocate_tp(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
-	struct ppa new_ppa = gc_alloc_and_write(conv_ftl, lpn, TRANS_IO);
+	struct ppa new_ppa = gc_alloc_and_write(conv_ftl, lpn, &conv_ftl->trans_wp);
 
 	conv_ftl->gtd[(uint32_t)(lpn - TRANS_LPN_BASE)] = new_ppa;
 }
 
-/* Relocate one data page to the GC frontier; tp_map is updated write-through. */
+/* Relocate one data page back to ITS GROUP's own write frontier (ld-tpftl model): the
+ * compacted data stays group-owned (re-GC-able) and group_wp[G] only ever holds group G's
+ * LPNs, so strict 1-line-1-group holds with no separate gc_wp / per-group GC frontier. */
 static struct ppa gc_relocate_data(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
-	struct ppa new_ppa = gc_alloc_and_write(conv_ftl, lpn, GC_IO);
+	struct write_pointer *wp = &conv_ftl->group_wp[group_of(conv_ftl, lpn)];
+	struct ppa new_ppa = gc_alloc_and_write(conv_ftl, lpn, wp);
 
 	dftl_set_ppa_gc(conv_ftl, lpn, new_ppa);
 	return new_ppa;
@@ -1897,9 +1951,11 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct line_mgmt *lm = &conv_ftl->lm;
 	struct line *line = get_line(conv_ftl, ppa);
-	/* drop this line's invalid pages from its group's running count before reset */
-	if (line->group != GROUP_NONE)
+	/* drop this line's invalid pages and owned-line count from its group before reset */
+	if (line->group != GROUP_NONE) {
 		conv_ftl->groups[line->group].invalid_pages -= line->ipc;
+		conv_ftl->groups[line->group].alloc_lines--;
+	}
 	line->ipc = 0;
 	line->vpc = 0;
 	line->group = GROUP_NONE; /* released line is no longer owned by any group */
@@ -1908,6 +1964,19 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	lm->free_line_cnt++;
 }
 
+/* foreground_gc()
+ * -> do_gc()
+ *    -> target group 선택
+ *    -> victim line 선택
+ *    -> valid page scan
+ *       -> translation page는 즉시 relocate
+ *       -> data page는 LPN만 수집
+ *    -> victim block erase
+ *    -> victim line free list로 반환
+ *    -> data LPN 정렬
+ *    -> data page를 LPN 순서로 relocate
+ *    -> 새 pgidx 기반 learned index 재학습
+ */
 static int do_gc(struct conv_ftl *conv_ftl, bool force)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -1924,15 +1993,24 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	 * and drain ALL of its victim lines in one pass, so its survivors relocate as a
 	 * single LPN-sorted contiguous run (Stage B/C) and its models retrain as a unit
 	 * (Stage D) — that contiguity is what lifts learned-index coverage. Relocation stays
-	 * on the shared GROUP_NONE gc_wp: re-tagging that frontier to the group corrupts the
-	 * incremental invalid_pages accounting (a frontier line outlives a single sweep, so
-	 * its pages get charged to one group and freed under another -> underflow). Once the
-	 * group is drained, top up to at least GC_BATCH_LINES with global victims (free-list
-	 * safety). Free-before-rewrite holds: Stage A frees every victim before Stage C
-	 * relocates, and relocation (< vpc of the freed lines) always consumes fewer lines
-	 * than were freed, so a sweep can never exhaust the free list.
+	 * on the shared GROUP_NONE gc_wp. Re-grouping the relocated data (tagging it with the
+	 * swept group so it stays re-GC-able) needs strict 1-line-1-group, which a single
+	 * shared frontier can't keep: its curline persists across sweeps, so the next group's
+	 * relocation lands in the previous group's tagged line -> GROUP ROUTING VIOLATION.
+	 * Proper re-grouping needs per-group gc frontiers (and OP headroom, since slack <
+	 * num_groups here). Once the group is drained, top up to at least GC_BATCH_LINES with
+	 * global victims (free-list safety). Free-before-rewrite holds: Stage A frees every
+	 * victim before Stage C relocates, and relocation (< vpc of the freed lines) consumes
+	 * fewer lines than were freed, so a sweep can never exhaust the free list.
 	 */
 	target = pick_most_invalid_group(conv_ftl);
+	/* WA control: only spend a whole-group sweep on a group that has accumulated
+	 * enough garbage to be worth compacting; otherwise fall to global lowest-vpc
+	 * victims (space-efficient, low write-amplification). */
+	if (target != GROUP_NONE &&
+	    conv_ftl->groups[target].invalid_pages <
+		    (uint32_t)GROUP_GC_MIN_INVALID_LINES * spp->pgs_per_line)
+		target = GROUP_NONE;
 
 	for (;;) {
 		struct line *victim_line = NULL;
@@ -1952,6 +2030,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 			if (nlines >= GC_BATCH_LINES)
 				break;
 			victim_line = select_victim_line(conv_ftl, force);
+			NVMEV_DEBUG_VERBOSE("select victim_line(fallback)\n");
 		}
 		if (!victim_line)
 			break;
@@ -2011,8 +2090,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 	/* pace GC: ensure at least a line's worth of write credits before the next
 	 * foreground_gc check, so small-ipc victims don't trigger a re-entry storm */
-	if (conv_ftl->wfc.credits_to_refill < spp->pgs_per_line)
-		conv_ftl->wfc.credits_to_refill = spp->pgs_per_line;
+	if (conv_ftl->wfc.credits_to_refill < (int64_t)spp->pgs_per_line)
+		conv_ftl->wfc.credits_to_refill = (int64_t)spp->pgs_per_line;
 
 	/*
 	 * Stage B — sort the whole batch's data LPNs ascending. Relocating in this order makes
@@ -2039,11 +2118,13 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 static void foreground_gc(struct conv_ftl *conv_ftl)
 {
-	if (should_gc_high(conv_ftl)) {
-		NVMEV_DEBUG_VERBOSE("should_gc_high passed");
-		/* perform GC here until !should_gc(conv_ftl) */
+	/* GC trigger #1 only (free flash blocks low): reclaim the most-invalid group (or global
+	 * lowest-vpc victims) in do_gc. Trigger #2 (per-group cumulative-block threshold) was
+	 * dropped — nvmevirt's bounded channel timing model can't absorb proactive whole-group GC
+	 * bursts under WEC=1, and at the near-full utilization where the learned index is measured
+	 * free-line pressure already drives GC (and model retraining) plenty. */
+	if (should_gc_high(conv_ftl))
 		do_gc(conv_ftl, true);
-	}
 }
 
 static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struct ppa ppa2)
@@ -2221,6 +2302,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			struct write_pointer *uwp =
 				&conv_ftl->group_wp[group_of(conv_ftl, local_lpn)];
 
+			ensure_write_pointer(conv_ftl, uwp, true);
 			ppa = get_new_page(conv_ftl, uwp);
 			/* update maptbl */
 			//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
@@ -2246,6 +2328,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 						    spp->pgs_per_oneshotpg * spp->pgsz);
 		}
 
+		atomic64_inc(&host_writes);
 		consume_write_credit(conv_ftl);
 		check_and_refill_write_credit(conv_ftl);
 	}

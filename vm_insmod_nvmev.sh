@@ -1,4 +1,4 @@
-sudo insmod ./nvmev.ko memmap_start=4G memmap_size=4G cpus=14,15
+sudo insmod ./nvmev.ko memmap_start=4G memmap_size=32G cpus=14,15
 
 sudo mkfs.ext4 -F /dev/nvme2n1
 

@@ -4,7 +4,13 @@
 #define _CHANNEL_MODEL_H
 
 /* Macros for channel model */
-#define NR_CREDIT_ENTRIES (1024 * 96)
+/* Look-ahead window the channel timing model can schedule into = NR_CREDIT_ENTRIES *
+ * UNIT_TIME_INTERVAL. LearnedFTL whole-group GC relocates a whole GTD-entry group in one
+ * sweep, which legitimately schedules a big NAND batch at once; at 1024*96 (~393ms) that
+ * batch + host backlog overflowed the array ("No free entry"/"Need to increase array size").
+ * Widen to ~2.1s so the faithful whole-group GC's schedule fits. credit_t is 1 byte, so this
+ * is ~512KB per channel. */
+#define NR_CREDIT_ENTRIES (1024 * 512)
 #define UNIT_TIME_INTERVAL (4000ULL) //ns
 #define UNIT_XFER_SIZE (128ULL) //bytes
 #define UNIT_XFER_CREDITS (1) //credits needed to transfer data(UNIT_XFER_SIZE)
@@ -37,7 +43,7 @@ struct channel_model {
 	credit_t avail_credits[NR_CREDIT_ENTRIES];
 };
 
-#define BANDWIDTH_TO_TX_TIME(MB_S) (((UNIT_XFER_SIZE)*NS_PER_SEC(1)) / (MB(MB_S)))
+#define BANDWIDTH_TO_TX_TIME(MB_S) (((UNIT_XFER_SIZE) * NS_PER_SEC(1)) / (MB(MB_S)))
 #define BANDWIDTH_TO_MAX_CREDITS(MB_S) \
 	(MB(MB_S) * UNIT_TIME_INTERVAL / NS_PER_SEC(1) / UNIT_XFER_SIZE * UNIT_XFER_CREDITS)
 
