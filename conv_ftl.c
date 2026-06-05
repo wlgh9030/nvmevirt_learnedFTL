@@ -621,7 +621,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	ssd_init_params(&spp, size, nr_parts);
 	conv_init_params(&cpp);
 
-	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
+	conv_ftls = vmalloc(sizeof(struct conv_ftl) * nr_parts);
 
 	for (i = 0; i < nr_parts; i++) {
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
@@ -678,7 +678,7 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 		kfree(conv_ftls[i].ssd);
 	}
 
-	kfree(conv_ftls);
+	vfree(conv_ftls);
 	ns->ftls = NULL;
 }
 
