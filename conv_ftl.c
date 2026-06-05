@@ -372,60 +372,53 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint32_
 	uint32_t tp_idx = e->lpn / entries_per_tp;
 	uint32_t entry_idx = e->lpn % entries_per_tp;
 	struct ppa old_tp_ppa = conv_ftl->gtd[tp_idx];
-	struct ppa new_tp_ppa;
 	struct nand_cmd cmd;
 	uint64_t nsecs_completed, nsecs_latest = *stime;
 
 	atomic64_inc(&tp_writebacks);
 
-	/* 새 페이지 할당: user-path eviction은 USER_IO, GC-path는 GC_IO stream으로 라우팅.
-	 * 통합 allocation(논문 DFTL baseline) 유지하면서 GC 중 phantom user line 개방을 방지. */
-	new_tp_ppa = get_new_page(conv_ftl, io_type);
-	mark_page_valid(conv_ftl, &new_tp_ppa);
-	advance_write_pointer(conv_ftl, io_type);
-	consume_write_credit(conv_ftl); /* TP write도 물리 페이지 소모 → WA를 GC 타이밍에 반영 */
-
-	if (mapped_ppa(&old_tp_ppa)) {
-		/* 기존 TP read 지연 시뮬레이션 */
-		cmd = (struct nand_cmd){
-			.type = io_type,
-			.cmd = NAND_READ,
-			.stime = nsecs_latest,
-			.xfer_size = spp->pgsz,
-			.interleave_pci_dma = false,
-			.ppa = &old_tp_ppa,
-		};
-		nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
-		nsecs_latest = max(nsecs_completed, nsecs_latest);
-
-		/* 기존 페이지 무효화 */
-		mark_page_invalid(conv_ftl, &old_tp_ppa);
-		set_rmap_ent(conv_ftl, INVALID_LPN, &old_tp_ppa);
-	}
-
 	/* dirty entry를 tp_data에 반영 (tp_data는 tp_idx로 직접 인덱싱) */
 	conv_ftl->tp_data[tp_idx * entries_per_tp + entry_idx] = e->ppa;
 
-	/* rmap에 translation page임을 기록 */
-	set_rmap_ent(conv_ftl, TRANS_LPN_BASE + tp_idx, &new_tp_ppa);
+	if (!mapped_ppa(&old_tp_ppa)) {
+		uint32_t stride = tp_idx;
+		old_tp_ppa.ppa = 0;
+		old_tp_ppa.g.ch = stride % spp->nchs;
+		stride /= spp->nchs;
+		old_tp_ppa.g.lun = stride % spp->luns_per_ch;
+		stride /= spp->luns_per_ch;
+		old_tp_ppa.g.pl = 0;
+		old_tp_ppa.g.blk = stride % spp->blks_per_lun;
+		stride /= spp->blks_per_lun;
+		old_tp_ppa.g.pg = stride % spp->pgs_per_blk;
+		conv_ftl->gtd[tp_idx] = old_tp_ppa;
+	}
 
-	/* NAND write 지연 시뮬레이션 (wordline 단위) */
+	/* 물리 페이지 할당/무효화 없이 NAND latency만 시뮬레이션 */
+	cmd = (struct nand_cmd){
+		.type = io_type,
+		.cmd = NAND_READ,
+		.stime = nsecs_latest,
+		.xfer_size = spp->pgsz,
+		.interleave_pci_dma = false,
+		.ppa = &old_tp_ppa,
+	};
+	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
+	nsecs_latest = max(nsecs_completed, nsecs_latest);
+
 	cmd = (struct nand_cmd){
 		.type = io_type,
 		.cmd = NAND_NOP,
 		.stime = nsecs_latest,
 		.interleave_pci_dma = false,
-		.ppa = &new_tp_ppa,
+		.ppa = &old_tp_ppa,
 	};
-	if (last_pg_in_wordline(conv_ftl, &new_tp_ppa)) {
+	if (last_pg_in_wordline(conv_ftl, &old_tp_ppa)) {
 		cmd.cmd = NAND_WRITE;
 		cmd.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
 	}
 	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
 	nsecs_latest = max(nsecs_completed, nsecs_latest);
-
-	/* GTD 업데이트 */
-	conv_ftl->gtd[tp_idx] = new_tp_ppa;
 
 	*stime = nsecs_latest;
 }
@@ -1361,10 +1354,10 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 
 void conv_ftl_get_debug_stats(u64 *hits, u64 *misses, u64 *loads, u64 *wbs)
 {
-	*hits   = atomic64_read(&cmt_hits);
+	*hits = atomic64_read(&cmt_hits);
 	*misses = atomic64_read(&cmt_misses);
-	*loads  = atomic64_read(&tp_loads);
-	*wbs    = atomic64_read(&tp_writebacks);
+	*loads = atomic64_read(&tp_loads);
+	*wbs = atomic64_read(&tp_writebacks);
 }
 
 void conv_ftl_reset_debug_stats(void)
