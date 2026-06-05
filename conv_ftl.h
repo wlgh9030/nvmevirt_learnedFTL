@@ -18,10 +18,15 @@
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
 
 /* learned index (LearnedFTL, HPCA'24) parameters */
-#define LR_MAX_INTERVALS 8	/* piecewise segments per translation page model */
-#define LR_TRAIN_THRESHOLD 30	/* min samples in a TP group to train a model */
-#define LR_FP_SHIFT 16		/* fixed-point fractional bits (kernel has no FPU) */
-#define GC_BATCH_LINES 4	/* victim lines batched per do_gc for segment cleaning */
+/* A/B switch: 1 = learned index serves reads (LearnedFTL); 0 = every CMT miss pays
+ * the translation read (plain DFTL). Flip + rebuild to isolate the learned index's
+ * IOPS contribution. SI/GC training still run when 0 but are unused (and a pure read
+ * phase does no training), so the on/off IOPS delta is exactly the read-path benefit. */
+#define LEARNED_INDEX_ENABLE 1
+#define LR_MAX_INTERVALS 8 /* piecewise segments per translation page model */
+#define LR_TRAIN_THRESHOLD 30 /* min samples in a TP group to train a model */
+#define LR_FP_SHIFT 16 /* fixed-point fractional bits (kernel has no FPU) */
+#define GC_BATCH_LINES 4 /* victim lines batched per do_gc for segment cleaning */
 
 /* GTD-entry grouping for group-granular GC (LearnedFTL). A group owns
  * TP_PER_GROUP consecutive translation pages; group_of(lpn) =
@@ -42,6 +47,7 @@ struct lr_node {
 	struct lr_breakpoint brks[LR_MAX_INTERVALS];
 	uint64_t start_lpn; /* model is relative to this lpn */
 	uint64_t start_ppa; /* ... and this pgidx */
+	uint32_t cover_len; /* #LPNs this model currently predicts; keep-longer arbiter (SI step ④) */
 	uint8_t u; /* 1 if trained/usable */
 };
 
@@ -153,10 +159,17 @@ struct conv_ftl {
 	struct lr_node *lr_nodes; /* learned-index models, indexed by tp_idx (size num_tp) */
 	uint8_t *bitmaps; /* per-lpn: 1 if model predicts it exactly (size tt_pgs) */
 
+	/* sequential-initialization (LearnedFTL): the current contiguous host-write run,
+	 * accumulated across writes and flushed as a y=x model when it breaks */
+	uint64_t si_run_start_lpn;
+	uint64_t si_run_start_pgidx;
+	uint32_t si_run_len;
+
 	/* training sample collection during one line GC (size pgs_per_line each) */
 	uint64_t *gc_train_lpns;
 	uint64_t *gc_train_pgidxs;
 	int gc_train_cnt;
+	uint32_t gc_train_cap; /* capacity of gc_train_* — one whole group's pages + top-up */
 
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
 	struct write_pointer *group_wp; /* per-group user write frontiers, size num_groups */

@@ -19,6 +19,7 @@ static atomic64_t model_trains = ATOMIC64_INIT(0);
 static atomic64_t model_bits_set = ATOMIC64_INIT(0);
 static atomic64_t model_uses = ATOMIC64_INIT(0);
 static atomic64_t model_hits = ATOMIC64_INIT(0);
+static atomic64_t si_installs = ATOMIC64_INIT(0); /* LearnedFTL sequential-init model installs */
 /* GC/training diagnostics */
 static atomic64_t gc_runs = ATOMIC64_INIT(0);
 static atomic64_t gc_reloc_pages = ATOMIC64_INIT(0);
@@ -505,8 +506,15 @@ static void lr_train_tp(struct conv_ftl *conv_ftl, uint64_t *lpns, uint64_t *pgi
 	uint64_t start_lpn = lpns[0];
 	uint64_t start_ppa = pgidxs[0];
 	int interval_num, j, i;
+	uint32_t total_su = 0;
 
 	if (n <= LR_TRAIN_THRESHOLD)
+		return;
+
+	/* keep-longer (LearnedFTL SI step ④, applied to GC training too): a GC fit can
+	 * predict at most n LPNs exactly, so if the current model already covers >= n
+	 * (e.g. a sequential-init y=x), don't let this smaller batch replace it. */
+	if (n <= node->cover_len)
 		return;
 
 	interval_num = n / LR_MAX_INTERVALS;
@@ -557,9 +565,11 @@ static void lr_train_tp(struct conv_ftl *conv_ftl, uint64_t *lpns, uint64_t *pgi
 			node->brks[j].b_fp = 0;
 		}
 		node->brks[j].valid_cnt = su;
+		total_su += su;
 		atomic64_add(su, &model_bits_set);
 	}
 
+	node->cover_len = total_su;
 	node->u = 1;
 	atomic64_inc(&model_trains);
 }
@@ -655,18 +665,23 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 
 	/* learned-index models: one per TP, all untrained (u=0) initially */
 	conv_ftl->lr_nodes = vmalloc(sizeof(struct lr_node) * conv_ftl->num_tp);
-	for (i = 0; i < conv_ftl->num_tp; i++)
+	for (i = 0; i < conv_ftl->num_tp; i++) {
 		conv_ftl->lr_nodes[i].u = 0;
+		conv_ftl->lr_nodes[i].cover_len = 0;
+	}
+
+	/* sequential-initialization run state starts empty */
+	conv_ftl->si_run_len = 0;
 
 	/* per-lpn prediction bitmap, init all zero */
 	conv_ftl->bitmaps = vzalloc(spp->tt_pgs);
 
-	/* GC training sample buffers: up to GC_BATCH_LINES victim lines batched per GC,
-	 * so size for a full batch of data pages (one entry per line page per line). */
-	conv_ftl->gc_train_lpns =
-		vmalloc(sizeof(uint64_t) * (size_t)GC_BATCH_LINES * spp->pgs_per_line);
-	conv_ftl->gc_train_pgidxs =
-		vmalloc(sizeof(uint64_t) * (size_t)GC_BATCH_LINES * spp->pgs_per_line);
+	/* GC training sample buffers: a whole-group sweep collects all of one group's live
+	 * data pages (<= TP_PER_GROUP * ents_per_tp) plus a small global top-up batch. */
+	conv_ftl->gc_train_cap =
+		TP_PER_GROUP * entries_per_tp(conv_ftl) + GC_BATCH_LINES * spp->pgs_per_line;
+	conv_ftl->gc_train_lpns = vmalloc(sizeof(uint64_t) * (size_t)conv_ftl->gc_train_cap);
+	conv_ftl->gc_train_pgidxs = vmalloc(sizeof(uint64_t) * (size_t)conv_ftl->gc_train_cap);
 	conv_ftl->gc_train_cnt = 0;
 
 	cmt->entry_pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
@@ -697,9 +712,11 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 		   wb, atomic64_read(&cmt_node_evicts), wb ? wb_entries / wb : 0,
 		   wb ? (wb_entries * 100 / wb) % 100 : 0);
 
-	NVMEV_INFO("LR model: trains=%lld bits_set=%lld uses=%lld hits=%lld\n",
+	NVMEV_INFO("LR model[%s]: trains=%lld bits_set=%lld uses=%lld hits=%lld si_installs=%lld\n",
+		   LEARNED_INDEX_ENABLE ? "ON" : "OFF",
 		   atomic64_read(&model_trains), atomic64_read(&model_bits_set),
-		   atomic64_read(&model_uses), atomic64_read(&model_hits));
+		   atomic64_read(&model_uses), atomic64_read(&model_hits),
+		   atomic64_read(&si_installs));
 
 	NVMEV_INFO("GC diag: runs=%lld reloc_pages=%lld groups=%lld under_thresh=%lld "
 		   "group_gc=%lld fallback_gc=%lld\n",
@@ -1089,8 +1106,6 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 	uint32_t ents = entries_per_tp(conv_ftl);
 	struct ppa *tp_buf =
 		(struct ppa *)(conv_ftl->tp_map + (size_t)(lpn / ents) * conv_ftl->ssd->sp.pgsz);
-	uint32_t tp_idx;
-	struct ppa pred;
 	struct ppa ppa;
 
 	if (e) {
@@ -1100,11 +1115,18 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 		return tp_buf[lpn % ents];
 	}
 
-	/* CMT miss: try the learned-index model before paying a translation read */
-	tp_idx = lpn / ents;
-	if (conv_ftl->bitmaps[lpn] && conv_ftl->lr_nodes[tp_idx].u &&
-	    model_predict(conv_ftl, lpn, &pred))
-		return pred;
+	/* CMT miss: try the learned-index model before paying a translation read.
+	 * Gated by LEARNED_INDEX_ENABLE so a perf run can A/B learnedFTL vs plain DFTL. */
+#if LEARNED_INDEX_ENABLE
+	{
+		uint32_t tp_idx = lpn / ents;
+		struct ppa pred;
+
+		if (conv_ftl->bitmaps[lpn] && conv_ftl->lr_nodes[tp_idx].u &&
+		    model_predict(conv_ftl, lpn, &pred))
+			return pred;
+	}
+#endif
 
 	/* prediction unavailable/failed: read translation page and cache it */
 	ppa = tp_load(conv_ftl, lpn, stime);
@@ -1120,12 +1142,93 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 	return tp_buf[lpn % ents];
 }
 
+/*
+ * LearnedFTL Sequential Initialization (HPCA'24, §IV), steps ②③④.
+ * Install the accumulated contiguous host-write run as a y=x model for its
+ * translation page, but only if it covers more LPNs than the existing model
+ * (keep-longer, step ④ — applied uniformly to SI and GC training). The run's
+ * LPNs and pgidxs are contiguous (allocation-order assignment), so the mapping
+ * is exactly pgidx = start_ppa + (lpn - start_lpn): a single slope-1 segment.
+ */
+static void si_flush_run(struct conv_ftl *conv_ftl)
+{
+	uint32_t ents = entries_per_tp(conv_ftl);
+	uint64_t s = conv_ftl->si_run_start_lpn;
+	uint64_t p = conv_ftl->si_run_start_pgidx;
+	uint32_t L = conv_ftl->si_run_len;
+	struct lr_node *node;
+	uint64_t i;
+	int j;
+
+	if (L == 0)
+		return;
+	conv_ftl->si_run_len = 0;
+
+	node = &conv_ftl->lr_nodes[s / ents];
+	if (L <= node->cover_len) /* step ③④: existing model is at least as long */
+		return;
+
+	/* step ②: one y=x segment (w=1, b=0), normalized to (s -> p) */
+	node->start_lpn = s;
+	node->start_ppa = p;
+	node->brks[0].w_fp = 1LL << LR_FP_SHIFT;
+	node->brks[0].b_fp = 0;
+	node->brks[0].key = L - 1;
+	node->brks[0].valid_cnt = L;
+	for (j = 1; j < LR_MAX_INTERVALS; j++) {
+		node->brks[j].w_fp = 0;
+		node->brks[j].b_fp = 0;
+		node->brks[j].key = L - 1; /* no coverage past the run */
+		node->brks[j].valid_cnt = 0;
+	}
+	node->cover_len = L;
+	node->u = 1;
+	for (i = s; i < s + L; i++)
+		conv_ftl->bitmaps[i] = 1;
+	atomic64_inc(&si_installs);
+}
+
+/*
+ * SI step ① + run accumulation, called once per host-written LPN. A host write
+ * invalidates any prior exact-prediction for this LPN (clear its bitmap bit, and
+ * keep cover_len = live bit count so keep-longer stays honest). If this write
+ * continues the current run (contiguous LPN and pgidx, same translation page) the
+ * run grows; otherwise the run is flushed and a new one starts here.
+ */
+static void si_update(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
+{
+	uint32_t ents = entries_per_tp(conv_ftl);
+	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
+
+	if (conv_ftl->bitmaps[lpn]) {
+		conv_ftl->bitmaps[lpn] = 0;
+		if (conv_ftl->lr_nodes[lpn / ents].cover_len)
+			conv_ftl->lr_nodes[lpn / ents].cover_len--;
+	}
+
+	if (conv_ftl->si_run_len &&
+	    lpn == conv_ftl->si_run_start_lpn + conv_ftl->si_run_len &&
+	    pgidx == conv_ftl->si_run_start_pgidx + conv_ftl->si_run_len &&
+	    lpn / ents == conv_ftl->si_run_start_lpn / ents) {
+		conv_ftl->si_run_len++;
+		return;
+	}
+
+	si_flush_run(conv_ftl);
+	conv_ftl->si_run_start_lpn = lpn;
+	conv_ftl->si_run_start_pgidx = pgidx;
+	conv_ftl->si_run_len = 1;
+}
+
 static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa, uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	uint32_t ents = entries_per_tp(conv_ftl);
 	struct ppa *tp_buf = (struct ppa *)(conv_ftl->tp_map + (size_t)(lpn / ents) * spp->pgsz);
 	struct cmt_entry *e;
+
+	/* SI step ① + contiguous-run accumulation for sequential initialization */
+	si_update(conv_ftl, lpn, &ppa);
 
 	/* write-through: tp_map이 항상 최신인 매핑 정답지가 된다.
 	 * 이후 CMT dirty/writeback은 정합성이 아니라 순수 NAND write latency 모델용. */
@@ -1160,6 +1263,15 @@ static void dftl_set_ppa_gc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa 
 	/* 매핑 정답은 tp_map 한 곳뿐이라 write-through만 하면 끝.
 	 * read는 CMT hit이어도 tp_map에서 읽으므로 GC가 캐시를 맞춰줄 필요가 없다. */
 	tp_buf[lpn % ents] = ppa;
+
+	/* relocated page moved: drop any stale exact-prediction (GC analog of SI step ①).
+	 * lr_train_collected re-sets bits for samples it can still predict after the move;
+	 * dropping cover_len here lets that retrain win keep-longer once the run has moved. */
+	if (conv_ftl->bitmaps[lpn]) {
+		conv_ftl->bitmaps[lpn] = 0;
+		if (conv_ftl->lr_nodes[lpn / ents].cover_len)
+			conv_ftl->lr_nodes[lpn / ents].cover_len--;
+	}
 }
 
 static void init_rmap(struct conv_ftl *conv_ftl)
@@ -1615,7 +1727,6 @@ static int pick_most_invalid_group(struct conv_ftl *conv_ftl)
  * Returns NULL if `group` has no (eligible) victim. */
 static struct line *select_victim_line_grp(struct conv_ftl *conv_ftl, int group)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct line_mgmt *lm = &conv_ftl->lm;
 	struct line *best = NULL;
 	uint32_t i;
@@ -1629,14 +1740,11 @@ static struct line *select_victim_line_grp(struct conv_ftl *conv_ftl, int group)
 			best = ln;
 	}
 
-	/* Only prefer a group victim when it is invalid-heavy enough that relocating
-	 * its surviving valid pages still nets reclaimed space. Otherwise return NULL
-	 * so do_gc falls back to the global lowest-vpc victim (space-efficient). This
-	 * keeps group GC from starving the free list under near-full, light-garbage
-	 * loads (the 'learned' workload: there it degenerates to the proven Phase-2
-	 * global selection) while still doing group-directed GC when a group has
-	 * accumulated real garbage (the 'bug-rw' workload). */
-	if (!best || best->vpc > spp->pgs_per_line / 2)
+	/* whole-group GC: return this group's lowest-vpc victim, or NULL when the group has
+	 * none left in the victim pq. No vpc cap — do_gc drains the entire target group in
+	 * one sweep so its survivors relocate as a single LPN-sorted contiguous run that the
+	 * learned models fit; do_gc tops up with global victims for free-list safety. */
+	if (!best)
 		return NULL;
 
 	pqueue_remove(lm->victim_line_pq, best);
@@ -1776,8 +1884,7 @@ static void gc_collect_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 			} else {
 				/* data page: gather LPN; relocated in sorted order in do_gc */
 				NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-				NVMEV_ASSERT(conv_ftl->gc_train_cnt <
-					     GC_BATCH_LINES * spp->pgs_per_line);
+				NVMEV_ASSERT(conv_ftl->gc_train_cnt < conv_ftl->gc_train_cap);
 				conv_ftl->gc_train_lpns[conv_ftl->gc_train_cnt++] = lpn;
 			}
 		}
@@ -1805,7 +1912,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
-	int flashpg, k, b;
+	int flashpg, k;
 	int nlines = 0;
 	int target;
 
@@ -1813,27 +1920,39 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	conv_ftl->wfc.credits_to_refill = 0;
 
 	/*
-	 * Stage A — group-granular victim selection (LearnedFTL): target the group with
-	 * the most reclaimable garbage and batch up to GC_BATCH_LINES of *its* victim
-	 * lines, so all collected data belongs to one group and Stage B/D sort + retrain
-	 * it as a unit. If that group has no reclaimable victim, fall back to the global
-	 * best victim so a pass never reclaims nothing. Each victim: relocate translation
-	 * pages immediately, gather data-page LPNs, erase + free right away.
+	 * Stage A — whole-group sweep (LearnedFTL group GC): target the most-invalid group
+	 * and drain ALL of its victim lines in one pass, so its survivors relocate as a
+	 * single LPN-sorted contiguous run (Stage B/C) and its models retrain as a unit
+	 * (Stage D) — that contiguity is what lifts learned-index coverage. Relocation stays
+	 * on the shared GROUP_NONE gc_wp: re-tagging that frontier to the group corrupts the
+	 * incremental invalid_pages accounting (a frontier line outlives a single sweep, so
+	 * its pages get charged to one group and freed under another -> underflow). Once the
+	 * group is drained, top up to at least GC_BATCH_LINES with global victims (free-list
+	 * safety). Free-before-rewrite holds: Stage A frees every victim before Stage C
+	 * relocates, and relocation (< vpc of the freed lines) always consumes fewer lines
+	 * than were freed, so a sweep can never exhaust the free list.
 	 */
 	target = pick_most_invalid_group(conv_ftl);
 
-	for (b = 0; b < GC_BATCH_LINES; b++) {
+	for (;;) {
 		struct line *victim_line = NULL;
 
-		/* prefer the most-invalid group's victims (group-granular cleaning), but
-		 * always fill the rest of the batch from the global best victim once that
-		 * group runs out, so every pass reclaims a full batch of lines. Otherwise a
-		 * group with few victims frees too few lines per pass and the free list
-		 * starves (free line exhaustion -> stale curline -> PG_FREE assert). */
+		/* bound a sweep to the gc_train buffer (one group + top-up); any leftover
+		 * victim is reclaimed by the next GC pass. Checked before popping so we never
+		 * detach a victim we cannot process. */
+		if (conv_ftl->gc_train_cnt + spp->pgs_per_line > conv_ftl->gc_train_cap)
+			break;
+
+		/* drain the target group's victims first (whole-group contiguity); once it is
+		 * empty, top up with global victims only until the pass has freed a batch, so a
+		 * near-clean target can't starve the free list (stale curline -> PG_FREE). */
 		if (target != GROUP_NONE)
 			victim_line = select_victim_line_grp(conv_ftl, target);
-		if (!victim_line)
+		if (!victim_line) {
+			if (nlines >= GC_BATCH_LINES)
+				break;
 			victim_line = select_victim_line(conv_ftl, force);
+		}
 		if (!victim_line)
 			break;
 
