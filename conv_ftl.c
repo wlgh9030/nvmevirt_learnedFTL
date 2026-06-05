@@ -443,15 +443,49 @@ static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
 	return NULL; /* 없으면 lookup failure (hit/miss는 demand path인 dftl_get_ppa에서 카운트) */
 }
 
+/* LRU 순서 변경 없이 hash lookup만 수행 (batch eviction용) */
+static struct cmt_entry *cmt_lookup_no_lru(struct dftl_cmt *cmt, uint64_t lpn)
+{
+	struct cmt_entry *entry;
+
+	hash_for_each_possible(cmt->ht, entry, hnode, lpn) {
+		if (entry->lpn == lpn)
+			return entry;
+	}
+	return NULL;
+}
+
 static struct cmt_entry *cmt_evict(struct conv_ftl *conv_ftl, uint32_t io_type, uint64_t *stime)
 {
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
 	struct cmt_entry *entry;
 
 	entry = list_last_entry(&cmt->lru_list, struct cmt_entry, lru);
 
-	if (entry->dirty)
-		tp_writeback(conv_ftl, entry, io_type, stime);
+	if (entry->dirty) {
+		uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
+		uint32_t tp_idx = entry->lpn / entries_per_tp;
+		uint64_t base_lpn = (uint64_t)tp_idx * entries_per_tp;
+		uint64_t lpn;
+		struct cmt_entry *e, *victim = entry;
+
+		/* 같은 TP에 속한 dirty entry를 모두 tp_data에 반영한 뒤 한 번만 writeback */
+		for (lpn = base_lpn; lpn < base_lpn + entries_per_tp; lpn++) {
+			e = cmt_lookup_no_lru(cmt, lpn);
+			if (!e || !e->dirty)
+				continue;
+			conv_ftl->tp_data[tp_idx * entries_per_tp + (lpn - base_lpn)] = e->ppa;
+			e->dirty = false;
+			if (e != victim) {
+				hash_del(&e->hnode);
+				list_del(&e->lru);
+				cmt->size--;
+				list_add(&e->lru, &cmt->free_list);
+			}
+		}
+		tp_writeback(conv_ftl, victim, io_type, stime);
+	}
 
 	hash_del(&entry->hnode);
 	list_del(&entry->lru);
@@ -1323,4 +1357,28 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 	}
 
 	return true;
+}
+
+void conv_ftl_get_debug_stats(u64 *hits, u64 *misses, u64 *loads, u64 *wbs)
+{
+	*hits   = atomic64_read(&cmt_hits);
+	*misses = atomic64_read(&cmt_misses);
+	*loads  = atomic64_read(&tp_loads);
+	*wbs    = atomic64_read(&tp_writebacks);
+}
+
+void conv_ftl_reset_debug_stats(void)
+{
+	atomic64_set(&cmt_hits, 0);
+	atomic64_set(&cmt_misses, 0);
+	atomic64_set(&tp_loads, 0);
+	atomic64_set(&tp_writebacks, 0);
+}
+
+void conv_ftl_set_debug_stats(u64 hits, u64 misses, u64 loads, u64 wbs)
+{
+	atomic64_set(&cmt_hits, hits);
+	atomic64_set(&cmt_misses, misses);
+	atomic64_set(&tp_loads, loads);
+	atomic64_set(&tp_writebacks, wbs);
 }

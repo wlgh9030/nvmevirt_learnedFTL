@@ -10,8 +10,8 @@
 #include "ssd_config.h"
 #include "ssd.h"
 
-#define CMT_CAPACITY 131072
-#define CMT_HASH_BITS 17
+#define CMT_CAPACITY 32768
+#define CMT_HASH_BITS 15
 #define CMT_HASH_SIZE (1 << CMT_HASH_BITS)
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
 
@@ -105,5 +105,9 @@ void conv_remove_namespace(struct nvmev_ns *ns);
 
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 			   struct nvmev_result *ret);
+
+void conv_ftl_get_debug_stats(u64 *hits, u64 *misses, u64 *loads, u64 *wbs);
+void conv_ftl_reset_debug_stats(void);
+void conv_ftl_set_debug_stats(u64 hits, u64 misses, u64 loads, u64 wbs);
 
 #endif

@@ -342,6 +342,21 @@ static int __proc_file_read(struct seq_file *m, void *data)
 			   total_io);
 	} else if (strcmp(filename, "debug") == 0) {
 		/* Left for later use */
+	} else if (strcmp(filename, "dftl") == 0) {
+		u64 hits, misses, loads, wbs;
+		u64 access, hit_pct, hit_frac;
+
+		conv_ftl_get_debug_stats(&hits, &misses, &loads, &wbs);
+		access = hits + misses;
+		hit_pct  = access ? hits * 100 / access : 0;
+		hit_frac = access ? (hits * 10000 / access) % 100 : 0;
+
+		seq_printf(m, "cmt_access:    %llu\n", access);
+		seq_printf(m, "hit_ratio:     %llu.%02llu%%\n", hit_pct, hit_frac);
+		seq_printf(m, "cmt_hits:      %llu\n", hits);
+		seq_printf(m, "cmt_misses:    %llu\n", misses);
+		seq_printf(m, "tp_loads:      %llu\n", loads);
+		seq_printf(m, "tp_writebacks: %llu\n", wbs);
 	}
 
 	return 0;
@@ -392,6 +407,14 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 		}
 	} else if (!strcmp(filename, "debug")) {
 		/* Left for later use */
+	} else if (!strcmp(filename, "dftl")) {
+		u64 hits, misses, loads, wbs;
+
+		if (strncmp(input, "reset", 5) == 0) {
+			conv_ftl_reset_debug_stats();
+		} else if (sscanf(input, "%llu %llu %llu %llu", &hits, &misses, &loads, &wbs) == 4) {
+			conv_ftl_set_debug_stats(hits, misses, loads, wbs);
+		}
 	}
 
 out:
@@ -448,6 +471,7 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
+	nvmev_vdev->proc_dftl = proc_create("dftl", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 }
 
 static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
@@ -457,6 +481,7 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 	remove_proc_entry("io_units", nvmev_vdev->proc_root);
 	remove_proc_entry("stat", nvmev_vdev->proc_root);
 	remove_proc_entry("debug", nvmev_vdev->proc_root);
+	remove_proc_entry("dftl", nvmev_vdev->proc_root);
 
 	remove_proc_entry("nvmev", NULL);
 
