@@ -76,8 +76,7 @@ enum {
 #define PLNS_PER_LUN (1)
 #define FLASH_PAGE_SIZE KB(32)
 #define ONESHOT_PAGE_SIZE (FLASH_PAGE_SIZE * 1)
-#define BLKS_PER_PLN \
-	(512) // 8GB total with 16MB lines (1 line == 1 group)
+#define BLKS_PER_PLN (512) // 8GB total with 16MB lines (1 line == 1 group)
 #define BLK_SIZE (0) /*BLKS_PER_PLN should not be 0 */
 static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 
@@ -107,7 +106,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define GLOBAL_WB_SIZE                                          \
 	(NAND_CHANNELS * LUNS_PER_NAND_CH * ONESHOT_PAGE_SIZE * \
 	 16) // ×8 of orig 1MB (=8MB): hold partial oneshot-wordlines for many per-group frontiers under random writes (TP_PER_GROUP=8)
-#define WRITE_EARLY_COMPLETION 1
+#define WRITE_EARLY_COMPLETION 0
 
 #define LBA_BITS (9)
 #define LBA_SIZE (1 << LBA_BITS)

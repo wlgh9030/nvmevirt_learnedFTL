@@ -645,8 +645,12 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 	 * free. NOT num_groups (== tt_lines here, which would exceed the device). With lazy
 	 * frontiers an idle/full group pins no open line, so a modest reserve suffices; raise
 	 * it or OP_AREA_PERCENT if random-write open-frontier spikes drain the free list. */
-	conv_ftl->cp.gc_thres_lines = 128;
-	conv_ftl->cp.gc_thres_lines_high = 128;
+	/* MUST be well below (tt_lines - namespace_lines) or GC triggers every write: with
+	 * tt_lines=512, namespace~393, free maxes at ~119, so a 128 reserve made free<=reserve
+	 * ALWAYS true -> constant GC -> WA~2.8 + channel flood -> timeout. 32 leaves ample
+	 * working room while only firing when the free list is genuinely low. */
+	conv_ftl->cp.gc_thres_lines = 32;
+	conv_ftl->cp.gc_thres_lines_high = 32;
 
 	NVMEV_INFO("FTL geometry: tt_pgs=%ld tt_lines=%d pgs_per_line=%d ents_per_tp=%u "
 		   "num_tp=%u TP_PER_GROUP=%d num_groups=%u frontiers=%u reserve=%u\n",

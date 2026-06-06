@@ -33,11 +33,10 @@
  * Raise to cut write-amplification (fewer, riper sweeps) at some learned-index
  * coverage; lower toward 0 for max coverage (every most-invalid group swept). */
 #define GROUP_GC_MIN_INVALID_LINES \
-	0 /* 2,4: unreachable for ~1-line groups (TP=8) under light random overwrite
-	   * (~630 invalid/group « pgs_per_line), so whole-group sweep never fired (group_gc=0,
-	   * all fallback). 0 = sweep the most-invalid group whenever do_gc runs → faithful
-	   * LearnedFTL LPN-sorted group relocation engages. Trade: relocates lightly-invalid
-	   * groups (WA↑). */
+	0 /* whole-group sweep only for groups ripe with >=4 lines of garbage; others fall to the
+	   * efficient global lowest-vpc fallback (frees near-empty lines, low valid relocation).
+	   * Was set to 0 mid-session (force group_gc>0) but that whole-group-sweeps barely-invalid
+	   * groups -> relocates mostly-valid data -> WA balloons (saw 2.90 on bug-rw vs ~1.x). */
 
 /* GTD-entry grouping for group-granular GC (LearnedFTL). A group owns
  * TP_PER_GROUP consecutive translation pages; group_of(lpn) =
