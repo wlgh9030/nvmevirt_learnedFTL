@@ -408,15 +408,13 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint32_
 
 	cmd = (struct nand_cmd){
 		.type = io_type,
-		.cmd = NAND_NOP,
+		.cmd = NAND_WRITE,
 		.stime = nsecs_latest,
+		.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
 		.interleave_pci_dma = false,
 		.ppa = &old_tp_ppa,
 	};
-	if (last_pg_in_wordline(conv_ftl, &old_tp_ppa)) {
-		cmd.cmd = NAND_WRITE;
-		cmd.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
-	}
+
 	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
 	nsecs_latest = max(nsecs_completed, nsecs_latest);
 
