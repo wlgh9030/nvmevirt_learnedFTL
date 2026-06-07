@@ -394,18 +394,7 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint32_
 		conv_ftl->gtd[tp_idx] = old_tp_ppa;
 	}
 
-	/* 물리 페이지 할당/무효화 없이 NAND latency만 시뮬레이션 */
-	cmd = (struct nand_cmd){
-		.type = io_type,
-		.cmd = NAND_READ,
-		.stime = nsecs_latest,
-		.xfer_size = spp->pgsz,
-		.interleave_pci_dma = false,
-		.ppa = &old_tp_ppa,
-	};
-	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
-	nsecs_latest = max(nsecs_completed, nsecs_latest);
-
+	/* tp_data has current state; only WRITE latency needed (no read-modify-write) */
 	cmd = (struct nand_cmd){
 		.type = io_type,
 		.cmd = NAND_WRITE,
@@ -1145,6 +1134,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	}
 
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
+		uint64_t tp_stime = srd.stime;
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
 		prev_ppa.ppa = UNMAPPED_PPA;
@@ -1156,7 +1146,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 			local_lpn = lpn / nr_parts;
 			//cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
-			cur_ppa = dftl_get_ppa(conv_ftl, local_lpn, &srd.stime);
+			cur_ppa = dftl_get_ppa(conv_ftl, local_lpn, &tp_stime);
 
 			if (!mapped_ppa(&cur_ppa) || !valid_ppa(conv_ftl, &cur_ppa)) {
 				NVMEV_DEBUG_VERBOSE("lpn 0x%llx not mapped to valid ppa\n",
@@ -1184,6 +1174,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			xfer_size = spp->pgsz;
 			prev_ppa = cur_ppa;
 		}
+
+		srd.stime = max(srd.stime, tp_stime);
 
 		// issue remaining io
 		if (xfer_size > 0) {
@@ -1246,16 +1238,23 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 	swr.stime = nsecs_latest;
 
+	{
+		uint64_t tp_stime[SSD_PARTITIONS];
+		uint32_t p;
+		for (p = 0; p < nr_parts; p++)
+			tp_stime[p] = nsecs_latest;
+
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 		uint64_t local_lpn;
 		uint64_t nsecs_completed = 0;
 		struct ppa ppa;
+		uint32_t part = lpn % nr_parts;
 
-		conv_ftl = &conv_ftls[lpn % nr_parts];
+		conv_ftl = &conv_ftls[part];
 		local_lpn = lpn / nr_parts;
 		//ppa = get_maptbl_ent(
 		//	conv_ftl, local_lpn); // Check whether the given LPN has been written before
-		ppa = dftl_get_ppa(conv_ftl, local_lpn, &swr.stime);
+		ppa = dftl_get_ppa(conv_ftl, local_lpn, &tp_stime[part]);
 		if (mapped_ppa(&ppa)) {
 			/* update old page information first */
 			mark_page_invalid(conv_ftl, &ppa);
@@ -1267,7 +1266,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		ppa = get_new_page(conv_ftl, USER_IO);
 		/* update maptbl */
 		//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
-		dftl_set_ppa(conv_ftl, local_lpn, ppa, USER_IO, &swr.stime);
+		dftl_set_ppa(conv_ftl, local_lpn, ppa, USER_IO, &tp_stime[part]);
 		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
 		/* update rmap */
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
@@ -1291,6 +1290,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		consume_write_credit(conv_ftl);
 		check_and_refill_write_credit(conv_ftl);
 	}
+	} /* end tp_stime scope */
 
 	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
 		/* Wait all flash operations */
