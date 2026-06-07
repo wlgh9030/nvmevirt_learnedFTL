@@ -532,7 +532,11 @@ static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *sti
 static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
 {
 	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
+	uint32_t tp_idx = (uint32_t)(lpn / entries_per_tp);
 	struct ppa ppa;
+	uint32_t i;
 
 	if (e) {
 		atomic64_inc(&cmt_hits);
@@ -540,9 +544,23 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 	}
 	atomic64_inc(&cmt_misses);
 
-	/* CMT miss: translation page에서 읽어와서 캐싱 (user read/write path 전용) */
+	/* CMT miss: NAND read latency는 TP 페이지당 한 번만 부과 */
 	ppa = tp_load(conv_ftl, lpn, stime);
-	cmt_insert(conv_ftl, lpn, ppa, false, USER_IO, stime);
+
+	/* 같은 TP 페이지의 모든 유효 entry를 bulk-insert하여 동일 TP 내 반복 NAND read 방지.
+	 * 요청된 lpn은 UNMAPPED이더라도 항상 insert (이후 CMT miss 반복 방지). */
+	for (i = 0; i < entries_per_tp; i++) {
+		uint64_t bulk_lpn = (uint64_t)tp_idx * entries_per_tp + i;
+		struct ppa bulk_ppa;
+
+		if (cmt_lookup(&conv_ftl->cmt, bulk_lpn))
+			continue;
+		bulk_ppa = conv_ftl->tp_data[(uint64_t)tp_idx * entries_per_tp + i];
+		if (bulk_lpn != lpn && !mapped_ppa(&bulk_ppa))
+			continue;
+		cmt_insert(conv_ftl, bulk_lpn, bulk_ppa, false, USER_IO, stime);
+	}
+
 	return ppa;
 }
 
