@@ -342,6 +342,10 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 		conv_ftl->tp_data[i].ppa = UNMAPPED_PPA;
 	}
 
+	conv_ftl->tp_dirty_lists = vmalloc(sizeof(struct list_head) * conv_ftl->num_tp);
+	for (i = 0; i < conv_ftl->num_tp; i++)
+		INIT_LIST_HEAD(&conv_ftl->tp_dirty_lists[i]);
+
 	cmt->pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
 	cmt->capacity = CMT_CAPACITY;
 	cmt->size = 0;
@@ -349,6 +353,7 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 	INIT_LIST_HEAD(&cmt->lru_list);
 	INIT_LIST_HEAD(&cmt->free_list);
 	for (i = 0; i < CMT_CAPACITY; i++) {
+		INIT_LIST_HEAD(&cmt->pool[i].dirty_link);
 		list_add(&cmt->pool[i].lru, &cmt->free_list);
 	}
 }
@@ -361,6 +366,7 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 
 	vfree(conv_ftl->gtd);
 	vfree(conv_ftl->tp_data);
+	vfree(conv_ftl->tp_dirty_lists);
 	vfree(conv_ftl->cmt.pool);
 }
 
@@ -394,20 +400,20 @@ static void tp_writeback(struct conv_ftl *conv_ftl, struct cmt_entry *e, uint32_
 		conv_ftl->gtd[tp_idx] = old_tp_ppa;
 	}
 
-	/* tp_data has current state; only WRITE latency needed (no read-modify-write) */
-	cmd = (struct nand_cmd){
-		.type = io_type,
-		.cmd = NAND_WRITE,
-		.stime = nsecs_latest,
-		.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
-		.interleave_pci_dma = false,
-		.ppa = &old_tp_ppa,
-	};
-
-	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
-	nsecs_latest = max(nsecs_completed, nsecs_latest);
-
-	*stime = nsecs_latest;
+	if (io_type != GC_IO) {
+		/* tp_data has current state; only WRITE latency needed (no read-modify-write) */
+		cmd = (struct nand_cmd){
+			.type = io_type,
+			.cmd = NAND_WRITE,
+			.stime = nsecs_latest,
+			.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
+			.interleave_pci_dma = false,
+			.ppa = &old_tp_ppa,
+		};
+		nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
+		nsecs_latest = max(nsecs_completed, nsecs_latest);
+		*stime = nsecs_latest;
+	}
 }
 
 static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
@@ -423,17 +429,6 @@ static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
 	return NULL; /* 없으면 lookup failure (hit/miss는 demand path인 dftl_get_ppa에서 카운트) */
 }
 
-/* LRU 순서 변경 없이 hash lookup만 수행 (batch eviction용) */
-static struct cmt_entry *cmt_lookup_no_lru(struct dftl_cmt *cmt, uint64_t lpn)
-{
-	struct cmt_entry *entry;
-
-	hash_for_each_possible(cmt->ht, entry, hnode, lpn) {
-		if (entry->lpn == lpn)
-			return entry;
-	}
-	return NULL;
-}
 
 static struct cmt_entry *cmt_evict(struct conv_ftl *conv_ftl, uint32_t io_type, uint64_t *stime)
 {
@@ -446,25 +441,21 @@ static struct cmt_entry *cmt_evict(struct conv_ftl *conv_ftl, uint32_t io_type, 
 	if (entry->dirty) {
 		uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 		uint32_t tp_idx = entry->lpn / entries_per_tp;
-		uint64_t base_lpn = (uint64_t)tp_idx * entries_per_tp;
-		uint64_t lpn;
-		struct cmt_entry *e, *victim = entry;
+		struct cmt_entry *e, *tmp;
 
-		/* 같은 TP에 속한 dirty entry를 모두 tp_data에 반영한 뒤 한 번만 writeback */
-		for (lpn = base_lpn; lpn < base_lpn + entries_per_tp; lpn++) {
-			e = cmt_lookup_no_lru(cmt, lpn);
-			if (!e || !e->dirty)
-				continue;
-			conv_ftl->tp_data[tp_idx * entries_per_tp + (lpn - base_lpn)] = e->ppa;
+		/* tp_dirty_lists 순회: O(실제 dirty 개수), hash scan O(512) 불필요 */
+		list_for_each_entry_safe(e, tmp, &conv_ftl->tp_dirty_lists[tp_idx], dirty_link) {
+			conv_ftl->tp_data[tp_idx * entries_per_tp + (uint32_t)(e->lpn % entries_per_tp)] = e->ppa;
+			list_del_init(&e->dirty_link);
 			e->dirty = false;
-			if (e != victim) {
+			if (e != entry) {
 				hash_del(&e->hnode);
 				list_del(&e->lru);
 				cmt->size--;
 				list_add(&e->lru, &cmt->free_list);
 			}
 		}
-		tp_writeback(conv_ftl, victim, io_type, stime);
+		tp_writeback(conv_ftl, entry, io_type, stime);
 	}
 
 	hash_del(&entry->hnode);
@@ -476,6 +467,8 @@ static struct cmt_entry *cmt_evict(struct conv_ftl *conv_ftl, uint32_t io_type, 
 static struct cmt_entry *cmt_insert(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa,
 				    bool dirty, uint32_t io_type, uint64_t *stime)
 {
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
 	struct cmt_entry *e;
 
@@ -488,6 +481,8 @@ static struct cmt_entry *cmt_insert(struct conv_ftl *conv_ftl, uint64_t lpn, str
 	e->lpn = lpn;
 	e->ppa = ppa;
 	e->dirty = dirty;
+	if (dirty)
+		list_add(&e->dirty_link, &conv_ftl->tp_dirty_lists[lpn / entries_per_tp]);
 	hash_add(cmt->ht, &e->hnode, lpn);
 	list_add(&e->lru, &cmt->lru_list);
 	cmt->size++;
@@ -567,10 +562,15 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa, uint32_t io_type,
 			 uint64_t *stime)
 {
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 	struct cmt_entry *e = cmt_lookup(&conv_ftl->cmt, lpn);
 	if (e) {
 		e->ppa = ppa;
-		e->dirty = true;
+		if (!e->dirty) {
+			e->dirty = true;
+			list_add(&e->dirty_link, &conv_ftl->tp_dirty_lists[lpn / entries_per_tp]);
+		}
 		return;
 	}
 
@@ -636,7 +636,7 @@ static void conv_init_params(struct convparams *cpp)
 	cpp->op_area_pcent = OP_AREA_PERCENT;
 	cpp->gc_thres_lines = 2; /* Need only two lines.(host write, gc)*/
 	cpp->gc_thres_lines_high = 2; /* Need only two lines.(host write, gc)*/
-	cpp->enable_gc_delay = 1;
+	cpp->enable_gc_delay = 0;
 	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100);
 }
 
@@ -1262,52 +1262,53 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		for (p = 0; p < nr_parts; p++)
 			tp_stime[p] = nsecs_latest;
 
-	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-		uint64_t local_lpn;
-		uint64_t nsecs_completed = 0;
-		struct ppa ppa;
-		uint32_t part = lpn % nr_parts;
+		for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+			uint64_t local_lpn;
+			uint64_t nsecs_completed = 0;
+			struct ppa ppa;
+			uint32_t part = lpn % nr_parts;
 
-		conv_ftl = &conv_ftls[part];
-		local_lpn = lpn / nr_parts;
-		//ppa = get_maptbl_ent(
-		//	conv_ftl, local_lpn); // Check whether the given LPN has been written before
-		ppa = dftl_get_ppa(conv_ftl, local_lpn, &tp_stime[part]);
-		if (mapped_ppa(&ppa)) {
-			/* update old page information first */
-			mark_page_invalid(conv_ftl, &ppa);
-			set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
-			NVMEV_DEBUG("%s: %lld is invalid, ", __func__, ppa2pgidx(conv_ftl, &ppa));
+			conv_ftl = &conv_ftls[part];
+			local_lpn = lpn / nr_parts;
+			//ppa = get_maptbl_ent(
+			//	conv_ftl, local_lpn); // Check whether the given LPN has been written before
+			ppa = dftl_get_ppa(conv_ftl, local_lpn, &tp_stime[part]);
+			if (mapped_ppa(&ppa)) {
+				/* update old page information first */
+				mark_page_invalid(conv_ftl, &ppa);
+				set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
+				NVMEV_DEBUG("%s: %lld is invalid, ", __func__,
+					    ppa2pgidx(conv_ftl, &ppa));
+			}
+
+			/* new write */
+			ppa = get_new_page(conv_ftl, USER_IO);
+			/* update maptbl */
+			//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+			dftl_set_ppa(conv_ftl, local_lpn, ppa, USER_IO, &tp_stime[part]);
+			NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
+			/* update rmap */
+			set_rmap_ent(conv_ftl, local_lpn, &ppa);
+
+			mark_page_valid(conv_ftl, &ppa);
+
+			/* need to advance the write pointer here */
+			advance_write_pointer(conv_ftl, USER_IO);
+
+			/* Aggregate write io in flash page */
+			if (last_pg_in_wordline(conv_ftl, &ppa)) {
+				swr.ppa = &ppa;
+
+				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
+				nsecs_latest = max(nsecs_completed, nsecs_latest);
+
+				schedule_internal_operation(req->sq_id, nsecs_completed, wbuf,
+							    spp->pgs_per_oneshotpg * spp->pgsz);
+			}
+
+			consume_write_credit(conv_ftl);
+			check_and_refill_write_credit(conv_ftl);
 		}
-
-		/* new write */
-		ppa = get_new_page(conv_ftl, USER_IO);
-		/* update maptbl */
-		//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
-		dftl_set_ppa(conv_ftl, local_lpn, ppa, USER_IO, &tp_stime[part]);
-		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
-		/* update rmap */
-		set_rmap_ent(conv_ftl, local_lpn, &ppa);
-
-		mark_page_valid(conv_ftl, &ppa);
-
-		/* need to advance the write pointer here */
-		advance_write_pointer(conv_ftl, USER_IO);
-
-		/* Aggregate write io in flash page */
-		if (last_pg_in_wordline(conv_ftl, &ppa)) {
-			swr.ppa = &ppa;
-
-			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
-			nsecs_latest = max(nsecs_completed, nsecs_latest);
-
-			schedule_internal_operation(req->sq_id, nsecs_completed, wbuf,
-						    spp->pgs_per_oneshotpg * spp->pgsz);
-		}
-
-		consume_write_credit(conv_ftl);
-		check_and_refill_write_credit(conv_ftl);
-	}
 	} /* end tp_stime scope */
 
 	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
