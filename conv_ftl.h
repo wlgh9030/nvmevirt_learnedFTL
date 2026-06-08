@@ -19,15 +19,15 @@ struct cmt_entry {
 	uint64_t lpn;
 	struct ppa ppa;
 	bool dirty;
-	struct list_head lru;
-	struct list_head dirty_link;
+	struct list_head lru;        /* free_list link */
+	struct list_head tp_link;    /* conv_ftl->tp_entry_lists[tp_idx] link */
+	struct list_head dirty_link; /* conv_ftl->tp_dirty_lists[tp_idx] link */
 	struct hlist_node hnode;
 };
 
 struct dftl_cmt {
 	struct cmt_entry *pool;
 	struct hlist_head ht[CMT_HASH_SIZE];
-	struct list_head lru_list;
 	struct list_head free_list;
 	uint32_t size;
 	uint32_t capacity;
@@ -87,8 +87,11 @@ struct conv_ftl {
 	//struct ppa *maptbl; /* page level mapping table */
 
 	struct ppa *gtd;
-	struct ppa *tp_data; /* TP page content, indexed by [tp_idx * entries_per_tp + entry_idx] */
-	struct list_head *tp_dirty_lists; /* per-TP dirty CMT entry lists, indexed by tp_idx */
+	struct ppa *tp_data;              /* TP page content: [tp_idx * entries_per_tp + entry_idx] */
+	struct list_head *tp_dirty_lists; /* per-TP dirty entry lists, indexed by tp_idx */
+	struct list_head *tp_entry_lists; /* per-TP all cached CMT entry lists, indexed by tp_idx */
+	struct list_head *tp_lru_nodes;   /* per-TP node in tp_lru_list when TP is cached */
+	struct list_head tp_lru_list;     /* TP-page level LRU list */
 	struct dftl_cmt cmt;
 	uint32_t num_tp;
 	void *mapped;
