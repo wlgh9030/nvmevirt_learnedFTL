@@ -340,26 +340,14 @@ static void init_dftl(struct conv_ftl *conv_ftl)
 	for (i = 0; i < conv_ftl->num_tp * entries_per_tp; i++)
 		conv_ftl->tp_data[i].ppa = UNMAPPED_PPA;
 
-	conv_ftl->tp_dirty_lists = vmalloc(sizeof(struct list_head) * conv_ftl->num_tp);
-	conv_ftl->tp_entry_lists = vmalloc(sizeof(struct list_head) * conv_ftl->num_tp);
-	conv_ftl->tp_lru_nodes   = vmalloc(sizeof(struct list_head) * conv_ftl->num_tp);
-	for (i = 0; i < conv_ftl->num_tp; i++) {
-		INIT_LIST_HEAD(&conv_ftl->tp_dirty_lists[i]);
-		INIT_LIST_HEAD(&conv_ftl->tp_entry_lists[i]);
+	conv_ftl->tp_dirty = vzalloc(sizeof(bool) * conv_ftl->num_tp);
+	conv_ftl->tp_lru_nodes = vmalloc(sizeof(struct list_head) * conv_ftl->num_tp);
+	for (i = 0; i < conv_ftl->num_tp; i++)
 		INIT_LIST_HEAD(&conv_ftl->tp_lru_nodes[i]);
-	}
 	INIT_LIST_HEAD(&conv_ftl->tp_lru_list);
 
-	cmt->pool = vmalloc(sizeof(struct cmt_entry) * CMT_CAPACITY);
 	cmt->capacity = CMT_CAPACITY;
 	cmt->size = 0;
-	hash_init(cmt->ht);
-	INIT_LIST_HEAD(&cmt->free_list);
-	for (i = 0; i < CMT_CAPACITY; i++) {
-		INIT_LIST_HEAD(&cmt->pool[i].tp_link);
-		INIT_LIST_HEAD(&cmt->pool[i].dirty_link);
-		list_add(&cmt->pool[i].lru, &cmt->free_list);
-	}
 }
 
 static void remove_dftl(struct conv_ftl *conv_ftl)
@@ -370,10 +358,8 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 
 	vfree(conv_ftl->gtd);
 	vfree(conv_ftl->tp_data);
-	vfree(conv_ftl->tp_dirty_lists);
-	vfree(conv_ftl->tp_entry_lists);
+	vfree(conv_ftl->tp_dirty);
 	vfree(conv_ftl->tp_lru_nodes);
-	vfree(conv_ftl->cmt.pool);
 }
 
 /* tp_data flush는 호출 전에 완료된 상태여야 함; 여기서는 NAND write만 수행 */
@@ -416,87 +402,48 @@ static void tp_writeback(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io
 	}
 }
 
-/* LPN lookup; hit 시 해당 TP page를 MRU로 승격 */
-static struct cmt_entry *cmt_lookup(struct conv_ftl *conv_ftl, uint64_t lpn)
-{
-	struct dftl_cmt *cmt = &conv_ftl->cmt;
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	uint32_t tp_idx = (uint32_t)(lpn / (spp->pgsz / sizeof(struct ppa)));
-	struct cmt_entry *entry;
-
-	hash_for_each_possible(cmt->ht, entry, hnode, lpn) {
-		if (entry->lpn == lpn) {
-			list_move(&conv_ftl->tp_lru_nodes[tp_idx], &conv_ftl->tp_lru_list);
-			return entry;
-		}
-	}
-	return NULL;
-}
-
 static inline bool tp_in_cmt(struct conv_ftl *conv_ftl, uint32_t tp_idx)
 {
 	/* INIT_LIST_HEAD/list_del_init → next=self → list_empty=true (not in list) */
 	return !list_empty(&conv_ftl->tp_lru_nodes[tp_idx]);
 }
 
-/* LRU TP page 전체(dirty+clean)를 한 번에 evict, tp_writeback 1회 */
 static void cmt_evict_tp_page(struct conv_ftl *conv_ftl, uint32_t io_type, uint64_t *stime)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
-	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 	struct list_head *lru_node;
 	uint32_t tp_idx;
-	struct cmt_entry *e, *tmp;
-	bool has_dirty = false;
 
 	NVMEV_ASSERT(!list_empty(&conv_ftl->tp_lru_list));
 
 	lru_node = conv_ftl->tp_lru_list.prev; /* 마지막 = LRU */
 	tp_idx = (uint32_t)(lru_node - conv_ftl->tp_lru_nodes);
 
-	/* dirty entries를 tp_data에 flush */
-	list_for_each_entry_safe(e, tmp, &conv_ftl->tp_dirty_lists[tp_idx], dirty_link) {
-		conv_ftl->tp_data[tp_idx * entries_per_tp + (uint32_t)(e->lpn % entries_per_tp)] = e->ppa;
-		list_del_init(&e->dirty_link);
-		e->dirty = false;
-		has_dirty = true;
-	}
-
-	if (has_dirty)
+	if (conv_ftl->tp_dirty[tp_idx]) {
 		tp_writeback(conv_ftl, tp_idx, io_type, stime);
-
-	/* 해당 TP의 모든 entries 제거 (dirty+clean) */
-	list_for_each_entry_safe(e, tmp, &conv_ftl->tp_entry_lists[tp_idx], tp_link) {
-		hash_del(&e->hnode);
-		list_del_init(&e->tp_link);
-		list_add(&e->lru, &cmt->free_list);
-		cmt->size--;
+		conv_ftl->tp_dirty[tp_idx] = false;
 	}
 
 	list_del_init(&conv_ftl->tp_lru_nodes[tp_idx]);
+	cmt->size--;
 }
 
-/* TP page 전체를 NAND에서 읽어 CMT에 적재; 이미 있으면 MRU 승격만 */
 static void tp_load_page(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io_type,
 			 uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
-	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 	struct ppa tp_ppa = conv_ftl->gtd[tp_idx];
-	uint32_t i;
 
 	if (tp_in_cmt(conv_ftl, tp_idx)) {
 		list_move(&conv_ftl->tp_lru_nodes[tp_idx], &conv_ftl->tp_lru_list);
 		return;
 	}
 
-	/* entries_per_tp 슬롯 확보 (TP page 단위 evict) */
-	while (cmt->size + entries_per_tp > cmt->capacity)
+	while (cmt->size >= cmt->capacity)
 		cmt_evict_tp_page(conv_ftl, io_type, stime);
 
-	/* GTD가 mapped인 경우만 NAND read */
+	/* GTD가 mapped인 경우만 NAND read (timing simulation) */
 	if (mapped_ppa(&tp_ppa)) {
 		struct nand_cmd rd = {
 			.type = USER_IO,
@@ -511,23 +458,8 @@ static void tp_load_page(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io
 		atomic64_inc(&tp_loads);
 	}
 
-	/* tp_data에서 entries_per_tp개 전부 CMT에 삽입 */
-	for (i = 0; i < entries_per_tp; i++) {
-		uint64_t bulk_lpn = (uint64_t)tp_idx * entries_per_tp + i;
-		struct cmt_entry *e = list_first_entry(&cmt->free_list, struct cmt_entry, lru);
-
-		list_del(&e->lru);
-		e->lpn = bulk_lpn;
-		e->ppa = conv_ftl->tp_data[tp_idx * entries_per_tp + i];
-		e->dirty = false;
-		INIT_LIST_HEAD(&e->dirty_link);
-		hash_add(cmt->ht, &e->hnode, bulk_lpn);
-		list_add(&e->tp_link, &conv_ftl->tp_entry_lists[tp_idx]);
-		cmt->size++;
-	}
-
-	/* TP page를 MRU로 등록 */
 	list_add(&conv_ftl->tp_lru_nodes[tp_idx], &conv_ftl->tp_lru_list);
+	cmt->size++;
 }
 
 static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
@@ -535,20 +467,17 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 	uint32_t tp_idx = (uint32_t)(lpn / entries_per_tp);
-	struct cmt_entry *e;
+	uint32_t local_idx = (uint32_t)(lpn % entries_per_tp);
 
-	e = cmt_lookup(conv_ftl, lpn);
-	if (e) {
+	if (tp_in_cmt(conv_ftl, tp_idx)) {
 		atomic64_inc(&cmt_hits);
-		return e->ppa;
+		list_move(&conv_ftl->tp_lru_nodes[tp_idx], &conv_ftl->tp_lru_list);
+	} else {
+		atomic64_inc(&cmt_misses);
+		tp_load_page(conv_ftl, tp_idx, USER_IO, stime);
 	}
 
-	atomic64_inc(&cmt_misses);
-	tp_load_page(conv_ftl, tp_idx, USER_IO, stime);
-
-	e = cmt_lookup(conv_ftl, lpn);
-	NVMEV_ASSERT(e);
-	return e->ppa;
+	return conv_ftl->tp_data[tp_idx * entries_per_tp + local_idx];
 }
 
 static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa, uint32_t io_type,
@@ -557,20 +486,15 @@ static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
 	uint32_t tp_idx = (uint32_t)(lpn / entries_per_tp);
-	struct cmt_entry *e;
+	uint32_t local_idx = (uint32_t)(lpn % entries_per_tp);
 
-	e = cmt_lookup(conv_ftl, lpn);
-	if (!e) {
+	if (!tp_in_cmt(conv_ftl, tp_idx))
 		tp_load_page(conv_ftl, tp_idx, io_type, stime);
-		e = cmt_lookup(conv_ftl, lpn);
-		NVMEV_ASSERT(e);
-	}
+	else
+		list_move(&conv_ftl->tp_lru_nodes[tp_idx], &conv_ftl->tp_lru_list);
 
-	e->ppa = ppa;
-	if (!e->dirty) {
-		e->dirty = true;
-		list_add(&e->dirty_link, &conv_ftl->tp_dirty_lists[tp_idx]);
-	}
+	conv_ftl->tp_data[tp_idx * entries_per_tp + local_idx] = ppa;
+	conv_ftl->tp_dirty[tp_idx] = true;
 }
 
 static void init_rmap(struct conv_ftl *conv_ftl)
@@ -1146,8 +1070,10 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		srd.stime += spp->fw_rd_lat;
 	}
 
+	uint64_t base_stime = srd.stime;
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
-		uint64_t tp_stime = srd.stime;
+		uint64_t tp_stime = base_stime;
+		srd.stime = base_stime;
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
 		prev_ppa.ppa = UNMAPPED_PPA;

@@ -5,32 +5,16 @@
 
 #include <linux/types.h>
 #include <linux/list.h>
-#include <linux/hashtable.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
 
-#define CMT_CAPACITY 32768
-#define CMT_HASH_BITS 15
-#define CMT_HASH_SIZE (1 << CMT_HASH_BITS)
+#define CMT_CAPACITY 256  /* number of TP pages to cache (256 × 512 entries = 128K LPN coverage) */
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
 
-struct cmt_entry {
-	uint64_t lpn;
-	struct ppa ppa;
-	bool dirty;
-	struct list_head lru;        /* free_list link */
-	struct list_head tp_link;    /* conv_ftl->tp_entry_lists[tp_idx] link */
-	struct list_head dirty_link; /* conv_ftl->tp_dirty_lists[tp_idx] link */
-	struct hlist_node hnode;
-};
-
 struct dftl_cmt {
-	struct cmt_entry *pool;
-	struct hlist_head ht[CMT_HASH_SIZE];
-	struct list_head free_list;
-	uint32_t size;
-	uint32_t capacity;
+	uint32_t size;     /* number of TP pages currently cached */
+	uint32_t capacity; /* max TP pages in cache */
 };
 
 struct convparams {
@@ -87,11 +71,10 @@ struct conv_ftl {
 	//struct ppa *maptbl; /* page level mapping table */
 
 	struct ppa *gtd;
-	struct ppa *tp_data;              /* TP page content: [tp_idx * entries_per_tp + entry_idx] */
-	struct list_head *tp_dirty_lists; /* per-TP dirty entry lists, indexed by tp_idx */
-	struct list_head *tp_entry_lists; /* per-TP all cached CMT entry lists, indexed by tp_idx */
-	struct list_head *tp_lru_nodes;   /* per-TP node in tp_lru_list when TP is cached */
-	struct list_head tp_lru_list;     /* TP-page level LRU list */
+	struct ppa *tp_data;            /* TP page content: [tp_idx * entries_per_tp + entry_idx] */
+	bool *tp_dirty;                 /* per-TP dirty flag */
+	struct list_head *tp_lru_nodes; /* per-TP node in tp_lru_list when TP is cached */
+	struct list_head tp_lru_list;   /* TP-page level LRU list */
 	struct dftl_cmt cmt;
 	uint32_t num_tp;
 	void *mapped;
