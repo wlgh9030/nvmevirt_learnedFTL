@@ -2308,9 +2308,6 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 			ensure_write_pointer(conv_ftl, uwp, true);
 			ppa = get_new_page(conv_ftl, uwp);
-			/* update maptbl */
-			//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
-			dftl_set_ppa(conv_ftl, local_lpn, ppa, &swr.stime);
 			NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
 			/* update rmap */
 			set_rmap_ent(conv_ftl, local_lpn, &ppa);
@@ -2319,6 +2316,18 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 			/* need to advance the write pointer here */
 			advance_write_pointer(conv_ftl, uwp);
+
+			/* update maptbl LAST. dftl_set_ppa()'s cmt_insert can evict a dirty
+			 * entry, flush its TP, and consume a write credit that re-enters
+			 * foreground GC. That GC relocates data pages onto the group frontiers
+			 * (this very uwp included), so it must run only after this page is
+			 * committed (valid + wp advanced) — otherwise it hands `ppa` back out
+			 * and the mark_page_valid() above fires on an already-valid page (kernel
+			 * BUG: PG_FREE assert). tp_map is updated inside dftl_set_ppa before that
+			 * cmt_insert, so the re-entrant GC still sees a consistent mapping. This
+			 * is the write-path mirror of the dftl_get_ppa() re-read guard. */
+			//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+			dftl_set_ppa(conv_ftl, local_lpn, ppa, &swr.stime);
 		}
 
 		/* Aggregate write io in flash page */
