@@ -211,10 +211,13 @@ static void NVMEV_GC_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned int i;
 
-	if (nvmev_vdev->config.nr_gc_workers == 0 || nvmev_vdev->nr_ns == 0)
+	if (nvmev_vdev->nr_ns == 0 || NS_SSD_TYPE(0) != SSD_TYPE_CONV)
 		return;
-	if (NS_SSD_TYPE(0) != SSD_TYPE_CONV)
+	if (nvmev_vdev->config.nr_gc_workers == 0) {
+		NVMEV_ERROR("gc_cpus not given: no background GC — writes will stall "
+			    "once free lines hit the reserve. Pass gc_cpus=<cpu>.\n");
 		return;
+	}
 
 	nvmev_vdev->gc_workers = kcalloc(nvmev_vdev->config.nr_gc_workers,
 					 sizeof(struct nvmev_gc_worker), GFP_KERNEL);
@@ -721,8 +724,11 @@ static void NVMeV_exit(void)
 		pci_remove_root_bus(nvmev_vdev->virt_bus);
 	}
 
-	NVMEV_GC_WORKER_FINAL(nvmev_vdev);
+	/* dispatcher 먼저: conv_write의 free-line stall은 GC 스레드가 line을
+	 * 회수해야 풀리므로, GC를 먼저 죽이면 stall 중인 dispatcher가 영원히
+	 * 안 멈춰 rmmod가 교착된다 */
 	NVMEV_DISPATCHER_FINAL(nvmev_vdev);
+	NVMEV_GC_WORKER_FINAL(nvmev_vdev);
 	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
 
 	NVMEV_NAMESPACE_FINAL(nvmev_vdev);

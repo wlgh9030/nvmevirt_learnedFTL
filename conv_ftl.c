@@ -192,15 +192,14 @@ static inline void consume_write_credit(struct conv_ftl *conv_ftl)
 	conv_ftl->wfc.write_credits--;
 }
 
-static void foreground_gc(struct conv_ftl *conv_ftl);
 static int do_gc(struct conv_ftl *conv_ftl, bool force);
 
 static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 {
+	/* GC는 background 스레드(nvmev_gc_fn)가 free-line threshold로 트리거한다.
+	 * credit 계정은 do_gc 진단(refill 로그)용으로만 유지. */
 	struct write_flow_control *wfc = &(conv_ftl->wfc);
 	if (wfc->write_credits <= 0) {
-		foreground_gc(conv_ftl);
-
 		wfc->write_credits += wfc->credits_to_refill;
 	}
 }
@@ -305,13 +304,19 @@ static void ensure_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer
 	if (wp->curline)
 		return;
 
-	/* ld-tpftl init_line_write_pointer: grab a fresh line only AFTER reclaiming when the
-	 * free list is low. gc_flag=true (user writes) reclaims first so allocation never hits
-	 * an empty free list under many open per-group frontiers; gc_flag=false (GC relocation,
-	 * trans writeback) must NOT re-enter do_gc. do_gc reclaims a GC_BATCH_LINES batch, so a
-	 * single call jumps free_line_cnt back above the threshold. */
-	if (gc_flag && conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines)
-		do_gc(conv_ftl, true);
+	/* gc_flag=true (user writes): GC를 직접 부르지 않는다(background GC 스레드 소관).
+	 * 대신 free line이 GC_RESERVE_LINES 이하로 떨어지면 lock을 풀고 GC 스레드가
+	 * 회수할 때까지 stall — wallclock 시간으로 드러나는 자연스러운 backpressure이며,
+	 * reserve 밑의 line들은 GC relocation(Stage C) frontier용으로 보존된다.
+	 * gc_flag=false (GC relocation, trans writeback)는 stall하지 않는다: GC 스레드
+	 * 자신이거나 reserve를 쓰는 쪽이므로 여기서 기다리면 교착. */
+	if (gc_flag) {
+		while (conv_ftl->lm.free_line_cnt <= GC_RESERVE_LINES) {
+			spin_unlock(&conv_ftl->ftl_lock);
+			cond_resched();
+			spin_lock(&conv_ftl->ftl_lock);
+		}
+	}
 
 	curline = get_next_free_line(conv_ftl);
 	NVMEV_ASSERT(curline);
@@ -1436,16 +1441,52 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 }
 
 /* Background GC worker (gc_cpus module param; one kthread per listed cpu).
- * Phase 1 stub: parks until GC work moves here from the foreground path. */
+ * worker i가 파티션 i, i+nr_workers, ... 를 담당한다.
+ *
+ * 두 가지 페이싱으로 foreground GC의 문제를 해소한다:
+ * - NAND backlog pacing: GC NAND op는 stime=0(now)으로 발행되므로 do_gc 한 번이
+ *   lun avail time을 수백 ms 미래로 민다. 다음 do_gc는 backlog가
+ *   GC_NAND_BACKLOG_NS 밑으로 빠진 뒤에만 실행 — burst가 wallclock보다 빨리
+ *   누적되며 chmodel credit window를 넘치던 flood를 차단한다.
+ * - free-line 트리거: should_gc_high(free <= thres 32)일 때만 동작. user 쓰기는
+ *   ensure_write_pointer에서 free <= GC_RESERVE_LINES면 stall하므로, GC가
+ *   pacing으로 기다리는 동안에도 교착 없이 wallclock 경과 -> backlog 소진 ->
+ *   GC 진행 -> user 재개로 풀린다. */
 int nvmev_gc_fn(void *data)
 {
 	struct nvmev_gc_worker *worker = data;
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)worker->ftl;
+	const unsigned int nr_workers = nvmev_vdev->config.nr_gc_workers;
+	unsigned int i;
 
-	(void)conv_ftls;
+	while (!kthread_should_stop()) {
+		bool did_work = false;
 
-	while (!kthread_should_stop())
-		schedule_timeout_interruptible(HZ / 10);
+		for (i = worker->id; i < SSD_PARTITIONS; i += nr_workers) {
+			struct conv_ftl *conv_ftl = &conv_ftls[i];
+			struct ssd *ssd = conv_ftl->ssd;
+
+			if (!should_gc_high(conv_ftl))
+				continue;
+
+			/* NAND backlog pacing (lock 밖: wallclock 경과만이 backlog를
+			 * 줄이므로 lock을 쥔 채 기다릴 이유가 없다) */
+			if (ssd_next_idle_time(ssd) >
+			    cpu_clock(ssd->cpu_nr_dispatcher) + GC_NAND_BACKLOG_NS)
+				continue;
+
+			spin_lock(&conv_ftl->ftl_lock);
+			if (should_gc_high(conv_ftl))
+				do_gc(conv_ftl, true);
+			spin_unlock(&conv_ftl->ftl_lock);
+			did_work = true;
+		}
+
+		if (did_work)
+			cond_resched();
+		else
+			schedule_timeout_interruptible(1);
+	}
 
 	return 0;
 }
@@ -1885,8 +1926,9 @@ static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn,
 			gcw.cmd = NAND_WRITE;
 			gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
 		}
-		/* GC NAND time disabled: isolate host I/O from GC device-busy time */
-		// ssd_advance_nand(conv_ftl->ssd, &gcw);
+		/* GC NAND time 복원: background GC 스레드가 backlog pacing으로 발행
+		 * 속도를 조절하므로 chmodel window를 넘치지 않는다 */
+		ssd_advance_nand(conv_ftl->ssd, &gcw);
 	}
 	return new_ppa;
 }
@@ -1946,8 +1988,7 @@ static void gc_collect_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 			.interleave_pci_dma = false,
 			.ppa = &ppa_copy,
 		};
-		/* GC NAND time disabled: isolate host I/O from GC device-busy time */
-		// ssd_advance_nand(conv_ftl->ssd, &gcr);
+		ssd_advance_nand(conv_ftl->ssd, &gcr);
 	}
 
 	for (i = 0; i < spp->pgs_per_flashpg; i++) {
@@ -1988,10 +2029,14 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	lm->free_line_cnt++;
 }
 
-/* Locking: 호출자(dispatcher의 conv_read/conv_write per-partition 구간)가 이미
- * 해당 파티션의 ftl_lock을 잡은 상태에서 중첩 호출된다 — 여기서 재획득 금지.
+/* Locking: 유일한 호출자는 background GC 스레드(nvmev_gc_fn)이며, 해당 파티션의
+ * ftl_lock을 잡은 채 호출한다 — 여기서 재획득 금지. do_gc는 lock을 끝까지 쥐고
+ * 원자적으로 수행된다(내부 yield 없음): Stage A가 victim을 erase/free한 뒤
+ * Stage C가 relocate하는 구조라, 중간에 lock을 풀면 dispatcher가 dangling
+ * mapping(maptbl이 erase된 페이지를 가리키는 상태)을 관측해 invalidate assert가
+ * 터진다. burst 완화는 do_gc 호출 사이의 NAND backlog pacing이 담당한다.
  *
- * foreground_gc()
+ * nvmev_gc_fn()
  * -> do_gc()
  *    -> target group 선택
  *    -> victim line 선택
@@ -2096,7 +2141,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 								.interleave_pci_dma = false,
 								.ppa = &ppa,
 							};
-							// ssd_advance_nand(conv_ftl->ssd, &gce);
+							ssd_advance_nand(conv_ftl->ssd, &gce);
 						}
 
 						lunp->gc_endtime = lunp->next_lun_avail_time;
@@ -2158,17 +2203,6 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	}
 
 	return 0;
-}
-
-static void foreground_gc(struct conv_ftl *conv_ftl)
-{
-	/* GC trigger #1 only (free flash blocks low): reclaim the most-invalid group (or global
-	 * lowest-vpc victims) in do_gc. Trigger #2 (per-group cumulative-block threshold) was
-	 * dropped — nvmevirt's bounded channel timing model can't absorb proactive whole-group GC
-	 * bursts under WEC=1, and at the near-full utilization where the learned index is measured
-	 * free-line pressure already drives GC (and model retraining) plenty. */
-	if (should_gc_high(conv_ftl))
-		do_gc(conv_ftl, true);
 }
 
 static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struct ppa ppa2)

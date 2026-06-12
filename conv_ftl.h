@@ -27,6 +27,15 @@
 #define LR_TRAIN_THRESHOLD 30 /* min samples in a TP group to train a model */
 #define LR_FP_SHIFT 16 /* fixed-point fractional bits (kernel has no FPU) */
 #define GC_BATCH_LINES 4 /* victim lines batched per do_gc for segment cleaning */
+/* background GC (전용 kthread, gc_cpus 파라미터): */
+#define GC_RESERVE_LINES \
+	4 /* user 쓰기는 free line이 이 밑으로 내려가면 stall — GC relocation(Stage C)이
+	   * frontier를 새로 열 때 쓸 line을 보장 (GC 트리거 thres 32보다 한참 아래) */
+#define GC_NAND_BACKLOG_NS \
+	(200ULL * 1000 * 1000) /* GC가 쌓아둘 수 있는 미래 NAND 작업 상한(200ms). do_gc 한
+	   * 번이 그룹 전체의 NAND op를 wallclock-now로 일괄 발행하므로, 다음 do_gc 전에
+	   * lun avail time이 이 밑으로 빠질 때까지 대기 — chmodel credit window(~2.1s)
+	   * overflow("No free entry" flood)를 원천 차단하는 pacing */
 /* WA control for whole-group GC: a group earns a one-sweep whole-group compaction
  * (contiguous LPN-sorted relocation) only once it holds at least this many lines'
  * worth of invalid pages; below it, do_gc uses efficient global lowest-vpc victims.
