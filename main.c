@@ -71,6 +71,7 @@ static unsigned int nr_io_units = 8;
 static unsigned int io_unit_shift = 12;
 
 static char *cpus;
+static char *gc_cpus;
 static unsigned int debug = 0;
 
 int io_using_dma = false;
@@ -109,6 +110,8 @@ module_param(io_unit_shift, uint, 0444);
 MODULE_PARM_DESC(io_unit_shift, "Size of each I/O unit (2^)");
 module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(cpus, "CPU list for process, completion(int.) threads, Seperated by Comma(,)");
+module_param(gc_cpus, charp, 0444);
+MODULE_PARM_DESC(gc_cpus, "CPU list for background GC threads, Separated by Comma(,)");
 module_param(debug, uint, 0644);
 
 // Returns true if an event is processed
@@ -202,6 +205,51 @@ static void NVMEV_DISPATCHER_FINAL(struct nvmev_dev *nvmev_vdev)
 		kthread_stop(nvmev_vdev->nvmev_dispatcher);
 		nvmev_vdev->nvmev_dispatcher = NULL;
 	}
+}
+
+static void NVMEV_GC_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
+{
+	unsigned int i;
+
+	if (nvmev_vdev->config.nr_gc_workers == 0 || nvmev_vdev->nr_ns == 0)
+		return;
+	if (NS_SSD_TYPE(0) != SSD_TYPE_CONV)
+		return;
+
+	nvmev_vdev->gc_workers = kcalloc(nvmev_vdev->config.nr_gc_workers,
+					 sizeof(struct nvmev_gc_worker), GFP_KERNEL);
+
+	for (i = 0; i < nvmev_vdev->config.nr_gc_workers; i++) {
+		struct nvmev_gc_worker *worker = &nvmev_vdev->gc_workers[i];
+
+		worker->id = i;
+		worker->ftl = nvmev_vdev->ns[0].ftls;
+		snprintf(worker->thread_name, sizeof(worker->thread_name), "nvmev_gc_%d", i);
+
+		worker->task_struct = kthread_create(nvmev_gc_fn, worker, "%s", worker->thread_name);
+		kthread_bind(worker->task_struct, nvmev_vdev->config.cpu_nr_gc_workers[i]);
+		wake_up_process(worker->task_struct);
+
+		NVMEV_INFO("%s started on cpu %d (node %d)\n", worker->thread_name,
+			   nvmev_vdev->config.cpu_nr_gc_workers[i],
+			   cpu_to_node(nvmev_vdev->config.cpu_nr_gc_workers[i]));
+	}
+}
+
+static void NVMEV_GC_WORKER_FINAL(struct nvmev_dev *nvmev_vdev)
+{
+	unsigned int i;
+
+	if (!nvmev_vdev->gc_workers)
+		return;
+
+	for (i = 0; i < nvmev_vdev->config.nr_gc_workers; i++) {
+		struct nvmev_gc_worker *worker = &nvmev_vdev->gc_workers[i];
+		if (!IS_ERR_OR_NULL(worker->task_struct))
+			kthread_stop(worker->task_struct);
+	}
+	kfree(nvmev_vdev->gc_workers);
+	nvmev_vdev->gc_workers = NULL;
 }
 
 #ifdef CONFIG_X86
@@ -522,6 +570,13 @@ static bool __load_configs(struct nvmev_config *config)
 		first = false;
 	}
 
+	config->nr_gc_workers = 0;
+	while ((cpu = strsep(&gc_cpus, ",")) != NULL) {
+		cpu_nr = (unsigned int)simple_strtol(cpu, NULL, 10);
+		config->cpu_nr_gc_workers[config->nr_gc_workers] = cpu_nr;
+		config->nr_gc_workers++;
+	}
+
 	return true;
 }
 
@@ -644,6 +699,7 @@ static int NVMeV_init(void)
 
 	NVMEV_IO_WORKER_INIT(nvmev_vdev);
 	NVMEV_DISPATCHER_INIT(nvmev_vdev);
+	NVMEV_GC_WORKER_INIT(nvmev_vdev);
 
 	pci_bus_add_devices(nvmev_vdev->virt_bus);
 
@@ -665,6 +721,7 @@ static void NVMeV_exit(void)
 		pci_remove_root_bus(nvmev_vdev->virt_bus);
 	}
 
+	NVMEV_GC_WORKER_FINAL(nvmev_vdev);
 	NVMEV_DISPATCHER_FINAL(nvmev_vdev);
 	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
 

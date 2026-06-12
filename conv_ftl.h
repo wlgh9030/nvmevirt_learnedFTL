@@ -199,6 +199,9 @@ void conv_remove_namespace(struct nvmev_ns *ns);
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 			   struct nvmev_result *ret);
 
+/* background GC kthread entry; data = struct nvmev_gc_worker * */
+int nvmev_gc_fn(void *data);
+
 /* Read-path hit counters, surfaced/reset via /proc/nvmev/cmt_stat */
 void conv_cmt_stat_read(uint64_t *access, uint64_t *hit, uint64_t *miss);
 void conv_cmt_stat_reset(void);

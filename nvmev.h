@@ -156,6 +156,8 @@ struct nvmev_config {
 	unsigned int cpu_nr_dispatcher;
 	unsigned int nr_io_workers;
 	unsigned int cpu_nr_io_workers[32];
+	unsigned int nr_gc_workers;
+	unsigned int cpu_nr_gc_workers[32];
 
 	/* TODO Refactoring storage configurations */
 	unsigned int nr_io_units;
@@ -213,6 +215,13 @@ struct nvmev_io_worker {
 	char thread_name[32];
 };
 
+struct nvmev_gc_worker {
+	unsigned int id;
+	struct task_struct *task_struct;
+	char thread_name[32];
+	void *ftl; /* conv_ftl partition(s) this worker drives (opaque to core) */
+};
+
 struct nvmev_dev {
 	struct pci_bus *virt_bus;
 	void *virtDev;
@@ -231,6 +240,7 @@ struct nvmev_dev {
 
 	struct nvmev_io_worker *io_workers;
 	unsigned int io_worker_turn;
+	struct nvmev_gc_worker *gc_workers;
 
 	void __iomem *msix_table;
 

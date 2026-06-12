@@ -2,6 +2,7 @@
 
 #include <linux/vmalloc.h>
 #include <linux/ktime.h>
+#include <linux/kthread.h>
 #include <linux/sched/clock.h>
 #include <linux/math64.h>
 
@@ -1430,6 +1431,21 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 		   size, ns->size, cpp.pba_pcent);
 
 	return;
+}
+
+/* Background GC worker (gc_cpus module param; one kthread per listed cpu).
+ * Phase 1 stub: parks until GC work moves here from the foreground path. */
+int nvmev_gc_fn(void *data)
+{
+	struct nvmev_gc_worker *worker = data;
+	struct conv_ftl *conv_ftls = (struct conv_ftl *)worker->ftl;
+
+	(void)conv_ftls;
+
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(HZ / 10);
+
+	return 0;
 }
 
 void conv_remove_namespace(struct nvmev_ns *ns)
