@@ -101,7 +101,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define FW_WBUF_LATENCY1 (460)
 #define FW_CH_XFER_LATENCY (0)
 #define OP_AREA_PERCENT \
-	(0.30) // 1-line-1-group (num_groups==tt_lines): each touched group holds an open frontier line, so need ample free-line slack; tunable
+	(0.4) // 1-line-1-group (num_groups==tt_lines): each touched group holds an open frontier line, so need ample free-line slack; tunable
 
 #define GLOBAL_WB_SIZE                                          \
 	(NAND_CHANNELS * LUNS_PER_NAND_CH * ONESHOT_PAGE_SIZE * \

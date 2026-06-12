@@ -1867,7 +1867,8 @@ static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn,
 			gcw.cmd = NAND_WRITE;
 			gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
 		}
-		ssd_advance_nand(conv_ftl->ssd, &gcw);
+		/* GC NAND time disabled: isolate host I/O from GC device-busy time */
+		// ssd_advance_nand(conv_ftl->ssd, &gcw);
 	}
 	return new_ppa;
 }
@@ -1927,7 +1928,8 @@ static void gc_collect_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 			.interleave_pci_dma = false,
 			.ppa = &ppa_copy,
 		};
-		ssd_advance_nand(conv_ftl->ssd, &gcr);
+		/* GC NAND time disabled: isolate host I/O from GC device-busy time */
+		// ssd_advance_nand(conv_ftl->ssd, &gcr);
 	}
 
 	for (i = 0; i < spp->pgs_per_flashpg; i++) {
@@ -1988,6 +1990,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	int flashpg, k;
 	int nlines = 0;
 	int target;
+	int free_before = conv_ftl->lm.free_line_cnt;
+	ktime_t gc_start = ktime_get();
 
 	conv_ftl->gc_train_cnt = 0;
 	conv_ftl->wfc.credits_to_refill = 0;
@@ -2071,7 +2075,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 								.interleave_pci_dma = false,
 								.ppa = &ppa,
 							};
-							ssd_advance_nand(conv_ftl->ssd, &gce);
+							// ssd_advance_nand(conv_ftl->ssd, &gce);
 						}
 
 						lunp->gc_endtime = lunp->next_lun_avail_time;
@@ -2084,8 +2088,13 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 		mark_line_free(conv_ftl, &ppa);
 	}
 
-	if (nlines == 0)
+	if (nlines == 0) {
+		s64 gc_us = ktime_us_delta(ktime_get(), gc_start);
+		NVMEV_INFO("do_gc NOVICTIM: free=%d (thres %d/%d) gc_us=%lld\n",
+			   conv_ftl->lm.free_line_cnt, conv_ftl->cp.gc_thres_lines,
+			   conv_ftl->cp.gc_thres_lines_high, gc_us);
 		return -1;
+	}
 
 	if (target != GROUP_NONE)
 		atomic64_inc(&gc_group_targeted);
@@ -2116,6 +2125,16 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 	/* Stage D — train learned-index models on the LPN-sorted (cross-line) runs. */
 	lr_train_collected(conv_ftl);
+
+	{
+		s64 gc_us = ktime_us_delta(ktime_get(), gc_start);
+		bool starving = conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines;
+		if (gc_us > 1000 || starving)
+			NVMEV_INFO("do_gc: free %d->%d nlines=%d refill=%lld gc_us=%lld%s\n",
+				   free_before, conv_ftl->lm.free_line_cnt, nlines,
+				   (long long)conv_ftl->wfc.credits_to_refill, gc_us,
+				   starving ? " STARVE" : "");
+	}
 
 	return 0;
 }

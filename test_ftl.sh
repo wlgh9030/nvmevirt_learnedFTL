@@ -9,7 +9,7 @@ set -u
 
 DEV=/dev/nvme2n1
 KO=./nvmev.ko
-MEMMAP="memmap_start=4G memmap_size=8G cpus=14,15"   # 8GB device; verify boot `memmap=` reserves 4G..12G
+MEMMAP="memmap_start=4G memmap_size=32G cpus=14,15"   # 8GB device; verify boot `memmap=` reserves 4G..12G
 SIZE=3G          # 디바이스보다 작게 (OP 제외 ~3.7G). GC 유발은 loops 로.
 COMMON="--filename=$DEV --ioengine=io_uring --direct=1 --group_reporting"
 PAPER_THREADS=64
