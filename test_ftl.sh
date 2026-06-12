@@ -4,7 +4,7 @@
 #   - learnedFTL 효과 측정: 순차 쓰기로 모델 학습 유발 후 랜덤 읽기로 예측 경로 가동
 #
 # 주의: raw 디바이스에 직접 쓰므로 $DEV 의 내용은 모두 지워집니다 (테스트 전용).
-# 사용법: ./test_ftl.sh [bug-seq | bug-rand | bug-rw | learned | paper-randread | paper-seqread | paper-read | all]
+# 사용법: ./test_ftl.sh [bug-seq | bug-rand | bug-rw | learned | paper-randread | paper-seqread | paper-read | sweep | all]
 set -u
 
 DEV=/dev/nvme2n1
@@ -206,6 +206,46 @@ paper_randread() { paper_read_workload "randread" "randwrite" "randread"; }
 paper_seqread()  { paper_read_workload "seqread"  "write"     "read"; }
 paper_read()     { paper_randread && paper_seqread; }
 
+# ---------------------------------------------------------------------------
+# 6) 성능 스윕 — bs x qd 그리드를 4개 워크로드로 측정해 collect.py 입력 포맷
+#    (<dir>/<bs>_<qd>.json) 으로 저장한 뒤 collect.py 로 summary.csv + 그래프 생성.
+#    전체 그리드는 7bs x 9qd x 4워크로드 = 252회 (회당 $SWEEP_RUNTIME 초) — 오래
+#    걸리면 아래 리스트를 줄여서 사용.
+SWEEP_DIR=./fio_results
+SWEEP_BS_LIST="4k 8k 16k 32k 64k 128k 256k"
+SWEEP_QD_LIST="1 2 4 8 16 32 64 128 256"
+SWEEP_RUNTIME=5
+
+sweep() {
+  echo "### [sweep] bs x qd grid -> $SWEEP_DIR -> collect.py"
+  load
+  local wl rw bs qd dir r
+  # write 워크로드를 먼저 돌려 read 워크로드가 매핑된 LPN 을 읽게 한다
+  for wl in sequentialwrite randomwrite sequentialread randomread; do
+    case $wl in
+      sequentialwrite) rw=write ;;
+      randomwrite)     rw=randwrite ;;
+      sequentialread)  rw=read ;;
+      randomread)      rw=randread ;;
+    esac
+    dir=$SWEEP_DIR/$wl
+    mkdir -p "$dir"
+    for bs in $SWEEP_BS_LIST; do
+      for qd in $SWEEP_QD_LIST; do
+        echo "-- $wl bs=$bs qd=$qd"
+        sudo fio --name="${wl}_${bs}_${qd}" $COMMON --rw=$rw --bs=$bs \
+            --iodepth=$qd --size=$SIZE --time_based --runtime=$SWEEP_RUNTIME \
+            --output-format=json --output="$dir/${bs}_${qd}.json"
+        r=$?
+        [ $r -ne 0 ] && echo "WARN($r): fio failed at $wl bs=$bs qd=$qd"
+      done
+    done
+  done
+  unload
+  echo "-- collect.py: summary.csv + graphs/"
+  python3 "$(dirname "$0")/../collect.py" --base "$SWEEP_DIR"
+}
+
 case "${1:-all}" in
   bug-seq)        bug_seq ;;
   bug-rand)       bug_rand ;;
@@ -214,6 +254,7 @@ case "${1:-all}" in
   paper-randread) paper_randread ;;
   paper-seqread)  paper_seqread ;;
   paper-read)     paper_read ;;
+  sweep)          sweep ;;
   all)            bug_seq; bug_rand; bug_rw; learned ;;
-  *) echo "usage: $0 [bug-seq|bug-rand|bug-rw|learned|paper-randread|paper-seqread|paper-read|all]"; exit 1 ;;
+  *) echo "usage: $0 [bug-seq|bug-rand|bug-rw|learned|paper-randread|paper-seqread|paper-read|sweep|all]"; exit 1 ;;
 esac

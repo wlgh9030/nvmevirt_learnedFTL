@@ -42,7 +42,7 @@
  * TP_PER_GROUP consecutive translation pages; group_of(lpn) =
  * (lpn / entries_per_tp) / TP_PER_GROUP. */
 #define TP_PER_GROUP \
-	128 /* group = 8 TP = 16MB = exactly 1 line: strict 1-line-1-group, light per-event GC */
+	16 /* group = 8 TP = 16MB = exactly 1 line: strict 1-line-1-group, light per-event GC */
 #define GROUP_NONE (-1) /* line/wp not owned by a data group (gc/trans frontier) */
 
 /* one piecewise-linear segment: pgidx ~= (w_fp*x + b_fp) >> LR_FP_SHIFT, x = lpn - start_lpn */

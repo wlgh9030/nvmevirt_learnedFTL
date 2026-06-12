@@ -70,7 +70,7 @@ enum {
 #define MDTS (6)
 #define CELL_MODE (CELL_MODE_MLC)
 
-#define SSD_PARTITIONS (1) // single FTL: 8GB config keeps 1 line == 1 group (16MB)
+#define SSD_PARTITIONS (4) // single FTL: 8GB config keeps 1 line == 1 group (16MB)
 #define NAND_CHANNELS (8)
 #define LUNS_PER_NAND_CH (2)
 #define PLNS_PER_LUN (1)
