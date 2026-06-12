@@ -1942,9 +1942,10 @@ static struct ppa gc_alloc_and_write(struct conv_ftl *conv_ftl, uint64_t lpn,
 			gcw.cmd = NAND_WRITE;
 			gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
 		}
-		/* GC NAND time 복원: background GC 스레드가 backlog pacing으로 발행
-		 * 속도를 조절하므로 chmodel window를 넘치지 않는다 */
-		ssd_advance_nand(conv_ftl->ssd, &gcw);
+		/* GC NAND time disabled: GC가 lun avail time을 밀면 host wordline 완료
+		 * (=write buffer release)도 같이 밀려 8MB 버퍼가 고갈된다 (learned
+		 * phase2 wedge). 버퍼 모델 보강 전까지 다시 꺼 둠. */
+		// ssd_advance_nand(conv_ftl->ssd, &gcw);
 	}
 	return new_ppa;
 }
@@ -2004,7 +2005,8 @@ static void gc_collect_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 			.interleave_pci_dma = false,
 			.ppa = &ppa_copy,
 		};
-		ssd_advance_nand(conv_ftl->ssd, &gcr);
+		/* GC NAND time disabled (gc_alloc_and_write 주석 참조) */
+		// ssd_advance_nand(conv_ftl->ssd, &gcr);
 	}
 
 	for (i = 0; i < spp->pgs_per_flashpg; i++) {
@@ -2157,7 +2159,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 								.interleave_pci_dma = false,
 								.ppa = &ppa,
 							};
-							ssd_advance_nand(conv_ftl->ssd, &gce);
+							// ssd_advance_nand(conv_ftl->ssd, &gce);
 						}
 
 						lunp->gc_endtime = lunp->next_lun_avail_time;
