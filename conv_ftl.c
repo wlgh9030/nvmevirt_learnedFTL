@@ -310,12 +310,21 @@ static void ensure_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer
 	 * reserve 밑의 line들은 GC relocation(Stage C) frontier용으로 보존된다.
 	 * gc_flag=false (GC relocation, trans writeback)는 stall하지 않는다: GC 스레드
 	 * 자신이거나 reserve를 쓰는 쪽이므로 여기서 기다리면 교착. */
-	if (gc_flag) {
+	if (gc_flag && conv_ftl->lm.free_line_cnt <= GC_RESERVE_LINES) {
+		ktime_t stall_start = ktime_get();
+
+		NVMEV_INFO("user stall part=%d free=%d (reserve %d)\n", conv_ftl->part_id,
+			   conv_ftl->lm.free_line_cnt, GC_RESERVE_LINES);
+		WRITE_ONCE(conv_ftl->user_stalled, true);
 		while (conv_ftl->lm.free_line_cnt <= GC_RESERVE_LINES) {
 			spin_unlock(&conv_ftl->ftl_lock);
 			cond_resched();
 			spin_lock(&conv_ftl->ftl_lock);
 		}
+		WRITE_ONCE(conv_ftl->user_stalled, false);
+		NVMEV_INFO("user stall end part=%d free=%d stalled_us=%lld\n", conv_ftl->part_id,
+			   conv_ftl->lm.free_line_cnt,
+			   ktime_us_delta(ktime_get(), stall_start));
 	}
 
 	curline = get_next_free_line(conv_ftl);
@@ -1341,6 +1350,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->ssd = ssd;
 
 	spin_lock_init(&conv_ftl->ftl_lock);
+	conv_ftl->user_stalled = false;
 
 	/* initialize maptbl */
 	//init_maptbl(conv_ftl); // mapping table
@@ -1413,6 +1423,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
 		ssd_init(ssd, &spp, cpu_nr_dispatcher);
 		conv_init_ftl(&conv_ftls[i], &cpp, ssd);
+		conv_ftls[i].part_id = i;
 	}
 
 	/* PCIe, Write buffer are shared by all instances*/
@@ -1470,9 +1481,14 @@ int nvmev_gc_fn(void *data)
 				continue;
 
 			/* NAND backlog pacing (lock 밖: wallclock 경과만이 backlog를
-			 * 줄이므로 lock을 쥔 채 기다릴 이유가 없다) */
-			if (ssd_next_idle_time(ssd) >
-			    cpu_clock(ssd->cpu_nr_dispatcher) + GC_NAND_BACKLOG_NS)
+			 * 줄이므로 lock을 쥔 채 기다릴 이유가 없다).
+			 * urgent bypass: user가 reserve stall에 갇힌 파티션은 pacing을
+			 * 무시하고 즉시 회수 — 안 그러면 dispatcher 전체가 멈춘 채
+			 * GC만 이 파티션을 계속 건너뛰는 wedge가 된다 (pm9d3의
+			 * user_reservation_stalled bypass와 동일) */
+			if (!READ_ONCE(conv_ftl->user_stalled) &&
+			    ssd_next_idle_time(ssd) >
+				    cpu_clock(ssd->cpu_nr_dispatcher) + GC_NAND_BACKLOG_NS)
 				continue;
 
 			spin_lock(&conv_ftl->ftl_lock);
@@ -2156,9 +2172,9 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 	if (nlines == 0) {
 		s64 gc_us = ktime_us_delta(ktime_get(), gc_start);
-		NVMEV_INFO("do_gc NOVICTIM: free=%d (thres %d/%d) gc_us=%lld\n",
-			   conv_ftl->lm.free_line_cnt, conv_ftl->cp.gc_thres_lines,
-			   conv_ftl->cp.gc_thres_lines_high, gc_us);
+		NVMEV_INFO("do_gc NOVICTIM: part=%d free=%d (thres %d/%d) gc_us=%lld\n",
+			   conv_ftl->part_id, conv_ftl->lm.free_line_cnt,
+			   conv_ftl->cp.gc_thres_lines, conv_ftl->cp.gc_thres_lines_high, gc_us);
 		return -1;
 	}
 
@@ -2196,9 +2212,9 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 		s64 gc_us = ktime_us_delta(ktime_get(), gc_start);
 		bool starving = conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines;
 		if (gc_us > 1000 || starving)
-			NVMEV_INFO("do_gc: free %d->%d nlines=%d refill=%lld gc_us=%lld%s\n",
-				   free_before, conv_ftl->lm.free_line_cnt, nlines,
-				   (long long)conv_ftl->wfc.credits_to_refill, gc_us,
+			NVMEV_INFO("do_gc: part=%d free %d->%d nlines=%d refill=%lld gc_us=%lld%s\n",
+				   conv_ftl->part_id, free_before, conv_ftl->lm.free_line_cnt,
+				   nlines, (long long)conv_ftl->wfc.credits_to_refill, gc_us,
 				   starving ? " STARVE" : "");
 	}
 

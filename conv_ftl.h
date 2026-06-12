@@ -172,6 +172,11 @@ struct conv_ftl {
 	 * section of conv_read/conv_write; nested paths (foreground GC, CMT
 	 * eviction, TP flush) run under it and must NOT re-acquire. */
 	spinlock_t ftl_lock;
+	uint32_t part_id; /* partition index (diag logs) */
+	/* user 쓰기가 free-line reserve에서 stall 중 (ensure_write_pointer).
+	 * GC 스레드는 이게 켜진 파티션의 NAND backlog pacing을 무시(urgent bypass)
+	 * — pacing이 starving 파티션을 계속 건너뛰면 stall이 영원히 안 풀린다. */
+	bool user_stalled;
 
 	struct convparams cp;
 	//struct ppa *maptbl; /* page level mapping table */
