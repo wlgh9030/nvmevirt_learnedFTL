@@ -1335,6 +1335,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 	conv_ftl->ssd = ssd;
 
+	spin_lock_init(&conv_ftl->ftl_lock);
+
 	/* initialize maptbl */
 	//init_maptbl(conv_ftl); // mapping table
 	init_dftl(conv_ftl);
@@ -1986,7 +1988,10 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	lm->free_line_cnt++;
 }
 
-/* foreground_gc()
+/* Locking: 호출자(dispatcher의 conv_read/conv_write per-partition 구간)가 이미
+ * 해당 파티션의 ftl_lock을 잡은 상태에서 중첩 호출된다 — 여기서 재획득 금지.
+ *
+ * foreground_gc()
  * -> do_gc()
  *    -> target group 선택
  *    -> victim line 선택
@@ -2218,6 +2223,11 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
+
+		/* per-partition section: mapping lookups + NAND advance under ftl_lock
+		 * so the background GC thread cannot relocate pages mid-lookup */
+		spin_lock(&conv_ftl->ftl_lock);
+
 		xfer_size = 0;
 		//prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
 		prev_ppa = dftl_get_ppa(conv_ftl, start_lpn / nr_parts, &srd.stime);
@@ -2265,6 +2275,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 			nsecs_latest = max(nsecs_completed, nsecs_latest);
 		}
+
+		spin_unlock(&conv_ftl->ftl_lock);
 	}
 
 	ret->nsecs_target = nsecs_latest;
@@ -2326,6 +2338,11 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
+
+		/* per-LPN section: invalidate-old + allocate + map + NAND advance must be
+		 * atomic w.r.t. the background GC thread of this partition */
+		spin_lock(&conv_ftl->ftl_lock);
+
 		//ppa = get_maptbl_ent(
 		//	conv_ftl, local_lpn); // Check whether the given LPN has been written before
 		ppa = dftl_get_ppa(conv_ftl, local_lpn, &swr.stime);
@@ -2379,6 +2396,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		atomic64_inc(&host_writes);
 		consume_write_credit(conv_ftl);
 		check_and_refill_write_credit(conv_ftl);
+
+		spin_unlock(&conv_ftl->ftl_lock);
 	}
 
 	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {

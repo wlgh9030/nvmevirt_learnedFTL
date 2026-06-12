@@ -157,6 +157,13 @@ struct gtd_group {
 struct conv_ftl {
 	struct ssd *ssd;
 
+	/* serializes FTL metadata (maptbl/tp_map/CMT/rmap/lines/wp/page state) and
+	 * this partition's NAND-timing advance between the dispatcher and the
+	 * background GC thread. Dispatcher holds it across each per-partition
+	 * section of conv_read/conv_write; nested paths (foreground GC, CMT
+	 * eviction, TP flush) run under it and must NOT re-acquire. */
+	spinlock_t ftl_lock;
+
 	struct convparams cp;
 	//struct ppa *maptbl; /* page level mapping table */
 
