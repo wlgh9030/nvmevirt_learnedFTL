@@ -11,7 +11,13 @@ static atomic64_t cmt_hits = ATOMIC64_INIT(0);
 static atomic64_t cmt_misses = ATOMIC64_INIT(0);
 static atomic64_t tp_loads = ATOMIC64_INIT(0);
 static atomic64_t tp_writebacks = ATOMIC64_INIT(0);
-
+/*
+#define READ_LAT_LOG_INTERVAL 10000
+static atomic64_t g_rd_fw_lat_sum      = ATOMIC64_INIT(0);
+static atomic64_t g_rd_mapping_lat_sum = ATOMIC64_INIT(0);
+static atomic64_t g_rd_nand_lat_sum    = ATOMIC64_INIT(0);
+static atomic64_t g_rd_cnt             = ATOMIC64_INIT(0);
+*/
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -364,12 +370,12 @@ static void remove_dftl(struct conv_ftl *conv_ftl)
 
 /* tp_data flush는 호출 전에 완료된 상태여야 함; 여기서는 NAND write만 수행 */
 static void tp_writeback(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io_type,
-			 uint64_t *stime)
+			 uint64_t base_stime, uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa old_tp_ppa = conv_ftl->gtd[tp_idx];
 	struct nand_cmd cmd;
-	uint64_t nsecs_completed, nsecs_latest = *stime;
+	uint64_t nsecs_completed;
 
 	atomic64_inc(&tp_writebacks);
 
@@ -391,14 +397,15 @@ static void tp_writeback(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io
 		cmd = (struct nand_cmd){
 			.type = io_type,
 			.cmd = NAND_WRITE,
-			.stime = nsecs_latest,
-			.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
+			.stime = base_stime,
+			/* a TP is a single 4KB page: transfer only pgsz; the full
+			 * wordline program latency is still charged by the model */
+			.xfer_size = spp->pgsz,
 			.interleave_pci_dma = false,
 			.ppa = &old_tp_ppa,
 		};
 		nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
-		nsecs_latest = max(nsecs_completed, nsecs_latest);
-		*stime = nsecs_latest;
+		*stime = max(nsecs_completed, *stime);
 	}
 }
 
@@ -408,7 +415,8 @@ static inline bool tp_in_cmt(struct conv_ftl *conv_ftl, uint32_t tp_idx)
 	return !list_empty(&conv_ftl->tp_lru_nodes[tp_idx]);
 }
 
-static void cmt_evict_tp_page(struct conv_ftl *conv_ftl, uint32_t io_type, uint64_t *stime)
+static void cmt_evict_tp_page(struct conv_ftl *conv_ftl, uint32_t io_type,
+			      uint64_t base_stime, uint64_t *stime)
 {
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
 	struct list_head *lru_node;
@@ -420,7 +428,7 @@ static void cmt_evict_tp_page(struct conv_ftl *conv_ftl, uint32_t io_type, uint6
 	tp_idx = (uint32_t)(lru_node - conv_ftl->tp_lru_nodes);
 
 	if (conv_ftl->tp_dirty[tp_idx]) {
-		tp_writeback(conv_ftl, tp_idx, io_type, stime);
+		tp_writeback(conv_ftl, tp_idx, io_type, base_stime, stime);
 		conv_ftl->tp_dirty[tp_idx] = false;
 	}
 
@@ -429,7 +437,7 @@ static void cmt_evict_tp_page(struct conv_ftl *conv_ftl, uint32_t io_type, uint6
 }
 
 static void tp_load_page(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io_type,
-			 uint64_t *stime)
+			 uint64_t base_stime, uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct dftl_cmt *cmt = &conv_ftl->cmt;
@@ -441,14 +449,14 @@ static void tp_load_page(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io
 	}
 
 	while (cmt->size >= cmt->capacity)
-		cmt_evict_tp_page(conv_ftl, io_type, stime);
+		cmt_evict_tp_page(conv_ftl, io_type, base_stime, stime);
 
-	/* GTD가 mapped인 경우만 NAND read (timing simulation) */
-	if (mapped_ppa(&tp_ppa)) {
+	/* GTD가 mapped인 경우만 NAND read (timing simulation), GC_IO는 타이밍 제외 */
+	if (mapped_ppa(&tp_ppa) && io_type != GC_IO) {
 		struct nand_cmd rd = {
 			.type = USER_IO,
 			.cmd = NAND_READ,
-			.stime = *stime,
+			.stime = base_stime,
 			.xfer_size = spp->pgsz,
 			.interleave_pci_dma = false,
 			.ppa = &tp_ppa,
@@ -462,7 +470,8 @@ static void tp_load_page(struct conv_ftl *conv_ftl, uint32_t tp_idx, uint32_t io
 	cmt->size++;
 }
 
-static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
+static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn,
+			       uint64_t base_stime, uint64_t *stime)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	uint32_t entries_per_tp = spp->pgsz / sizeof(struct ppa);
@@ -474,7 +483,7 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 		list_move(&conv_ftl->tp_lru_nodes[tp_idx], &conv_ftl->tp_lru_list);
 	} else {
 		atomic64_inc(&cmt_misses);
-		tp_load_page(conv_ftl, tp_idx, USER_IO, stime);
+		tp_load_page(conv_ftl, tp_idx, USER_IO, base_stime, stime);
 	}
 
 	return conv_ftl->tp_data[tp_idx * entries_per_tp + local_idx];
@@ -489,7 +498,7 @@ static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa
 	uint32_t local_idx = (uint32_t)(lpn % entries_per_tp);
 
 	if (!tp_in_cmt(conv_ftl, tp_idx))
-		tp_load_page(conv_ftl, tp_idx, io_type, stime);
+		tp_load_page(conv_ftl, tp_idx, io_type, *stime, stime);
 	else
 		list_move(&conv_ftl->tp_lru_nodes[tp_idx], &conv_ftl->tp_lru_list);
 
@@ -1055,6 +1064,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		.interleave_pci_dma = true,
 	};
 
+	// mark 1
+
 	NVMEV_ASSERT(conv_ftls);
 	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn,
 			    nr_lba, end_lpn);
@@ -1071,6 +1082,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	}
 
 	uint64_t base_stime = srd.stime;
+	//uint64_t max_tp_stime = base_stime;
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
 		uint64_t tp_stime = base_stime;
 		srd.stime = base_stime;
@@ -1085,7 +1097,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 			local_lpn = lpn / nr_parts;
 			//cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
-			cur_ppa = dftl_get_ppa(conv_ftl, local_lpn, &tp_stime);
+			cur_ppa = dftl_get_ppa(conv_ftl, local_lpn, base_stime, &tp_stime);
 
 			if (!mapped_ppa(&cur_ppa) || !valid_ppa(conv_ftl, &cur_ppa)) {
 				NVMEV_DEBUG_VERBOSE("lpn 0x%llx not mapped to valid ppa\n",
@@ -1104,6 +1116,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			}
 
 			if (xfer_size > 0) {
+				/* data read cannot start before its mapping is loaded */
+				srd.stime = max(srd.stime, tp_stime);
 				srd.xfer_size = xfer_size;
 				srd.ppa = &prev_ppa;
 				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
@@ -1115,6 +1129,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		}
 
 		srd.stime = max(srd.stime, tp_stime);
+		//max_tp_stime = max(max_tp_stime, tp_stime);
 
 		// issue remaining io
 		if (xfer_size > 0) {
@@ -1127,6 +1142,29 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 	ret->nsecs_target = nsecs_latest;
 	ret->status = NVME_SC_SUCCESS;
+/*
+	{
+		uint64_t fw_lat      = base_stime - nsecs_start;
+		uint64_t mapping_lat = max_tp_stime - base_stime;
+		uint64_t nand_lat    = nsecs_latest > max_tp_stime ? nsecs_latest - max_tp_stime : 0;
+		long long cnt        = atomic64_add_return(1, &g_rd_cnt);
+
+		atomic64_add(fw_lat,      &g_rd_fw_lat_sum);
+		atomic64_add(mapping_lat, &g_rd_mapping_lat_sum);
+		atomic64_add(nand_lat,    &g_rd_nand_lat_sum);
+
+		if (cnt % READ_LAT_LOG_INTERVAL == 0) {
+			NVMEV_INFO("[read_lat %lld reqs] FW avg=%llu ns, mapping avg=%llu ns, NAND avg=%llu ns\n",
+				   cnt,
+				   atomic64_read(&g_rd_fw_lat_sum)      / READ_LAT_LOG_INTERVAL,
+				   atomic64_read(&g_rd_mapping_lat_sum)  / READ_LAT_LOG_INTERVAL,
+				   atomic64_read(&g_rd_nand_lat_sum)     / READ_LAT_LOG_INTERVAL);
+			atomic64_set(&g_rd_fw_lat_sum,      0);
+			atomic64_set(&g_rd_mapping_lat_sum,  0);
+			atomic64_set(&g_rd_nand_lat_sum,     0);
+		}
+	}
+*/
 	return true;
 }
 
@@ -1193,7 +1231,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			local_lpn = lpn / nr_parts;
 			//ppa = get_maptbl_ent(
 			//	conv_ftl, local_lpn); // Check whether the given LPN has been written before
-			ppa = dftl_get_ppa(conv_ftl, local_lpn, &tp_stime[part]);
+			ppa = dftl_get_ppa(conv_ftl, local_lpn, tp_stime[part], &tp_stime[part]);
 			if (mapped_ppa(&ppa)) {
 				/* update old page information first */
 				mark_page_invalid(conv_ftl, &ppa);
@@ -1230,6 +1268,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			consume_write_credit(conv_ftl);
 			check_and_refill_write_credit(conv_ftl);
 		}
+
+		/* mapping (TP load/writeback) must complete before the write is done */
+		for (p = 0; p < nr_parts; p++)
+			nsecs_latest = max(nsecs_latest, tp_stime[p]);
 	} /* end tp_stime scope */
 
 	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
