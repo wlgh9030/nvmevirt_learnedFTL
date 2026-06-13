@@ -105,7 +105,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 
 #define GLOBAL_WB_SIZE                                          \
 	(NAND_CHANNELS * LUNS_PER_NAND_CH * ONESHOT_PAGE_SIZE * \
-	 16) // ×8 of orig 1MB (=8MB): hold partial oneshot-wordlines for many per-group frontiers under random writes (TP_PER_GROUP=8)
+	 64) // ×8 of orig 1MB (=8MB): hold partial oneshot-wordlines for many per-group frontiers under random writes (TP_PER_GROUP=8)
 #define WRITE_EARLY_COMPLETION 0
 
 #define LBA_BITS (9)
