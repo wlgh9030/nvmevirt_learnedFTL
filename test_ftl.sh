@@ -7,9 +7,9 @@
 # 사용법: ./test_ftl.sh [bug-seq | bug-rand | bug-rw | learned | paper-randread | paper-seqread | paper-read | sweep | all]
 set -u
 
-DEV=/dev/nvme2n1
+DEV=/dev/nvme3n1
 KO=./nvmev.ko
-MEMMAP="memmap_start=4G memmap_size=32G cpus=14,15 gc_cpus=13"   # gc_cpus = background GC thread (isolcpus 중 하나)
+MEMMAP="memmap_start=4G memmap_size=28G cpus=14,15 gc_cpus=13"   # gc_cpus = background GC thread (isolcpus 중 하나)
 SIZE=3G          # 디바이스보다 작게 (OP 제외 ~3.7G). GC 유발은 loops 로.
 COMMON="--filename=$DEV --ioengine=io_uring --direct=1 --group_reporting"
 PAPER_THREADS=64

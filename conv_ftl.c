@@ -313,8 +313,8 @@ static void ensure_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer
 	if (gc_flag && conv_ftl->lm.free_line_cnt <= GC_RESERVE_LINES) {
 		ktime_t stall_start = ktime_get();
 
-		NVMEV_INFO("user stall part=%d free=%d (reserve %d)\n", conv_ftl->part_id,
-			   conv_ftl->lm.free_line_cnt, GC_RESERVE_LINES);
+		// NVMEV_INFO("user stall part=%d free=%d (reserve %d)\n", conv_ftl->part_id,
+		// 	   conv_ftl->lm.free_line_cnt, GC_RESERVE_LINES);
 		WRITE_ONCE(conv_ftl->user_stalled, true);
 		while (conv_ftl->lm.free_line_cnt <= GC_RESERVE_LINES) {
 			spin_unlock(&conv_ftl->ftl_lock);
@@ -322,9 +322,9 @@ static void ensure_write_pointer(struct conv_ftl *conv_ftl, struct write_pointer
 			spin_lock(&conv_ftl->ftl_lock);
 		}
 		WRITE_ONCE(conv_ftl->user_stalled, false);
-		NVMEV_INFO("user stall end part=%d free=%d stalled_us=%lld\n", conv_ftl->part_id,
-			   conv_ftl->lm.free_line_cnt,
-			   ktime_us_delta(ktime_get(), stall_start));
+		// NVMEV_INFO("user stall end part=%d free=%d stalled_us=%lld\n", conv_ftl->part_id,
+		// 	   conv_ftl->lm.free_line_cnt,
+		// 	   ktime_us_delta(ktime_get(), stall_start));
 	}
 
 	curline = get_next_free_line(conv_ftl);
@@ -2210,15 +2210,16 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	/* Stage D — train learned-index models on the LPN-sorted (cross-line) runs. */
 	lr_train_collected(conv_ftl);
 
-	{
-		s64 gc_us = ktime_us_delta(ktime_get(), gc_start);
-		bool starving = conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines;
-		if (gc_us > 1000 || starving)
-			NVMEV_INFO("do_gc: part=%d free %d->%d nlines=%d refill=%lld gc_us=%lld%s\n",
-				   conv_ftl->part_id, free_before, conv_ftl->lm.free_line_cnt,
-				   nlines, (long long)conv_ftl->wfc.credits_to_refill, gc_us,
-				   starving ? " STARVE" : "");
-	}
+	// {
+	// 	s64 gc_us = ktime_us_delta(ktime_get(), gc_start);
+	// 	bool starving = conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines;
+	// 	if (gc_us > 1000 || starving)
+	// 		NVMEV_INFO(
+	// 			"do_gc: part=%d free %d->%d nlines=%d refill=%lld gc_us=%lld%s\n",
+	// 			conv_ftl->part_id, free_before, conv_ftl->lm.free_line_cnt, nlines,
+	// 			(long long)conv_ftl->wfc.credits_to_refill, gc_us,
+	// 			starving ? " STARVE" : "");
+	// }
 
 	return 0;
 }
@@ -2247,6 +2248,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	uint64_t lpn;
 	uint64_t nsecs_start = req->nsecs_start;
 	uint64_t nsecs_completed, nsecs_latest = nsecs_start;
+	uint64_t nsecs_rd_base;
 	uint32_t xfer_size, i;
 	uint32_t nr_parts = ns->nr_parts;
 
@@ -2272,6 +2274,10 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	} else {
 		srd.stime += spp->fw_rd_lat;
 	}
+	/* per-partition start time: each partition is an independent NAND chip, so its
+	 * TP loads must start from this common base rather than chaining onto the
+	 * previous partition's accumulated stime (which serializes the partitions). */
+	nsecs_rd_base = srd.stime;
 
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
@@ -2280,6 +2286,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		 * so the background GC thread cannot relocate pages mid-lookup */
 		spin_lock(&conv_ftl->ftl_lock);
 
+		srd.stime = nsecs_rd_base;
 		xfer_size = 0;
 		//prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
 		prev_ppa = dftl_get_ppa(conv_ftl, start_lpn / nr_parts, &srd.stime);
@@ -2358,6 +2365,13 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t nsecs_xfer_completed;
 	uint32_t allocated_buf_size;
 
+	/* per-partition write timeline: the partitions are independent NAND chips, so
+	 * each partition's TP load/writeback latency must accumulate on its own clock
+	 * instead of chaining through a single shared swr.stime (which serializes all
+	 * partitions and over-counts latency by ~nr_parts). */
+	uint64_t part_stime[SSD_PARTITIONS];
+	uint32_t i;
+
 	struct nand_cmd swr = {
 		.type = USER_IO,
 		.cmd = NAND_WRITE,
@@ -2381,14 +2395,16 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, LBA_TO_BYTE(nr_lba));
 	nsecs_xfer_completed = nsecs_latest;
 
-	swr.stime = nsecs_latest;
+	for (i = 0; i < nr_parts; i++)
+		part_stime[i] = nsecs_latest;
 
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 		uint64_t local_lpn;
 		uint64_t nsecs_completed = 0;
+		uint32_t part = lpn % nr_parts;
 		struct ppa ppa;
 
-		conv_ftl = &conv_ftls[lpn % nr_parts];
+		conv_ftl = &conv_ftls[part];
 		local_lpn = lpn / nr_parts;
 
 		/* per-LPN section: invalidate-old + allocate + map + NAND advance must be
@@ -2397,7 +2413,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 		//ppa = get_maptbl_ent(
 		//	conv_ftl, local_lpn); // Check whether the given LPN has been written before
-		ppa = dftl_get_ppa(conv_ftl, local_lpn, &swr.stime);
+		ppa = dftl_get_ppa(conv_ftl, local_lpn, &part_stime[part]);
 		if (mapped_ppa(&ppa)) {
 			/* update old page information first */
 			mark_page_invalid(conv_ftl, &ppa);
@@ -2431,11 +2447,12 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			 * cmt_insert, so the re-entrant GC still sees a consistent mapping. This
 			 * is the write-path mirror of the dftl_get_ppa() re-read guard. */
 			//set_maptbl_ent(conv_ftl, local_lpn, &ppa);
-			dftl_set_ppa(conv_ftl, local_lpn, ppa, &swr.stime);
+			dftl_set_ppa(conv_ftl, local_lpn, ppa, &part_stime[part]);
 		}
 
 		/* Aggregate write io in flash page */
 		if (last_pg_in_wordline(conv_ftl, &ppa)) {
+			swr.stime = part_stime[part];
 			swr.ppa = &ppa;
 
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
