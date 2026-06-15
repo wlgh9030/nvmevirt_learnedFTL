@@ -10,10 +10,10 @@
 #include "ssd_config.h"
 #include "ssd.h"
 
-#define CMT_CAPACITY 64
-#define CMT_ENTRY_HASH_BITS 6
+#define CMT_CAPACITY 131072
+#define CMT_ENTRY_HASH_BITS 17
 #define CMT_ENTRY_HASH_SIZE (1 << CMT_ENTRY_HASH_BITS)
-#define CMT_NODE_HASH_BITS 6
+#define CMT_NODE_HASH_BITS 10
 #define CMT_NODE_HASH_SIZE (1 << CMT_NODE_HASH_BITS)
 #define TRANS_LPN_BASE (INVALID_LPN - (1ULL << 32))
 
@@ -23,6 +23,13 @@
  * IOPS contribution. SI/GC training still run when 0 but are unused (and a pure read
  * phase does no training), so the on/off IOPS delta is exactly the read-path benefit. */
 #define LEARNED_INDEX_ENABLE 1
+/* CMT fill granularity A/B switch (DFTL CMT 관리 단위):
+ * 1 = translation-page granular: CMT miss 시 그 TP 1장의 mapped entry(<=512)를 통째로
+ *     캐시하고 evict도 TP node 단위. 같은 TP 안 인접 lpn 재접근의 NAND translation read를
+ *     없앤다(DFTL 정석). 0 = entry granular: miss 시 요청 lpn 1개만 캐시/evict(fine-grained).
+ * 두 모드 모두 CMT_CAPACITY entry 슬롯이라는 동일 메모리 예산을 공유하므로 fill 단위만
+ * 격리 비교된다. LEARNED_INDEX_ENABLE과 직교 — model_predict가 흡수 못 한 miss에만 작동. */
+#define CMT_FILL_TP 1
 #define LR_MAX_INTERVALS 8 /* piecewise segments per translation page model */
 #define LR_TRAIN_THRESHOLD 30 /* min samples in a TP group to train a model */
 #define LR_FP_SHIFT 16 /* fixed-point fractional bits (kernel has no FPU) */

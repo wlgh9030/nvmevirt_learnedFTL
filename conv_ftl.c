@@ -981,6 +981,7 @@ static struct cmt_entry *cmt_lookup(struct dftl_cmt *cmt, uint64_t lpn)
 	return NULL; /* 없으면 lookup failure */
 }
 
+#if !CMT_FILL_TP
 /* LRU tail TPnode에서 entry 하나만 evict한다. dirty victim이면 TP 전체를 flush해
  * 같은 TPnode에 남은 dirty entries는 clean으로 유지한다. */
 static void cmt_evict_entry(struct conv_ftl *conv_ftl, uint64_t *stime)
@@ -1071,6 +1072,127 @@ retry:
 	cmt->entry_size++;
 	return e;
 }
+#endif /* !CMT_FILL_TP */
+
+#if CMT_FILL_TP
+/* free entry 하나를 node에 매단다(해시/리스트/카운터 갱신). entry 슬롯 공간은 호출자가
+ * 미리 확보한다 — entry_free_list가 비어있지 않음을 보장한 뒤 호출. */
+static struct cmt_entry *cmt_attach_entry(struct dftl_cmt *cmt, struct tp_node *node,
+					  uint64_t lpn, struct ppa ppa, bool dirty)
+{
+	struct cmt_entry *e = list_first_entry(&cmt->entry_free_list, struct cmt_entry, sibling);
+
+	list_del(&e->sibling);
+	e->lpn = lpn;
+	e->ppa = ppa;
+	e->dirty = dirty;
+	e->parent = node;
+	hash_add(cmt->entry_ht, &e->hnode, lpn);
+	list_add(&e->sibling, &node->entries);
+	node->entry_count++;
+	if (dirty)
+		node->dirty_count++;
+	cmt->entry_size++;
+	return e;
+}
+
+/* LRU tail TP node를 통째로 evict한다. dirty가 하나라도 있으면 TP 1장을 flush(=NAND
+ * 영속화)한 뒤 node의 모든 entry를 free list로 돌려보낸다. */
+static void cmt_evict_node(struct conv_ftl *conv_ftl, uint64_t *stime)
+{
+	struct dftl_cmt *cmt = &conv_ftl->cmt;
+	struct tp_node *node = list_last_entry(&cmt->node_lru, struct tp_node, lru);
+	struct cmt_entry *e, *tmp;
+
+	if (node->dirty_count)
+		tp_writeback_node(conv_ftl, node, stime);
+
+	list_for_each_entry_safe(e, tmp, &node->entries, sibling) {
+		hash_del(&e->hnode);
+		list_del(&e->sibling);
+		e->lpn = INVALID_LPN;
+		e->ppa.ppa = UNMAPPED_PPA;
+		e->dirty = false;
+		e->parent = NULL;
+		list_add(&e->sibling, &cmt->entry_free_list);
+		cmt->entry_size--;
+	}
+
+	hash_del(&node->hnode);
+	list_del(&node->lru);
+	list_add(&node->lru, &cmt->node_free_list);
+	node->entry_count = 0;
+	node->dirty_count = 0;
+	cmt->node_size--;
+	atomic64_inc(&cmt_node_evicts);
+}
+
+/*
+ * TP-granular fill: CMT miss가 난 lpn이 속한 translation page `tp_idx` 한 장을 통째로
+ * 캐시한다. tp_map은 write-through라 늘 최신이므로 NAND를 다시 읽지 않고 거기서 mapped
+ * entry를 전부 읽어 새 TP node 하나에 clean으로 올린다(같은 TP 안 인접 lpn 재접근의
+ * translation read 제거). evict가 node 단위라 "node가 있으면 그 시점 mapped entry가 전부
+ * 캐시됨"이 불변식 — 이미 node가 있는데 들어온 경우는 UNMAPPED였다가 방금 처음 mapped된
+ * target 하나만 보충한다. target_lpn의 entry 포인터를 반환(캐시할 게 없으면 NULL).
+ */
+static struct cmt_entry *cmt_fill_tp(struct conv_ftl *conv_ftl, uint32_t tp_idx,
+				     uint64_t target_lpn, uint64_t *stime)
+{
+	struct dftl_cmt *cmt = &conv_ftl->cmt;
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t ents = entries_per_tp(conv_ftl);
+	struct ppa *tp_buf = (struct ppa *)(conv_ftl->tp_map + (size_t)tp_idx * spp->pgsz);
+	uint64_t base_lpn = (uint64_t)tp_idx * ents;
+	struct tp_node *node = node_lookup(cmt, tp_idx);
+	struct cmt_entry *target = NULL;
+	uint32_t i, want = 0;
+
+	if (node) {
+		/* 이미 통째 캐시됨 → MRU로 올리고 빠진 target 하나만 보충.
+		 * (read의 UNMAPPED target은 캐시할 게 없으므로 건너뛴다.) */
+		list_move(&node->lru, &cmt->node_lru);
+		if (!mapped_ppa(&tp_buf[target_lpn - base_lpn]))
+			return NULL;
+		if (cmt->entry_size + 1 > cmt->entry_capacity)
+			cmt_evict_node(conv_ftl, stime); /* node는 MRU라 evict 대상 아님 */
+		return cmt_attach_entry(cmt, node, target_lpn,
+					tp_buf[target_lpn - base_lpn], false);
+	}
+
+	/* TP가 캐시에 없음 → mapped entry를 모두 통째로 올린다 */
+	for (i = 0; i < ents; i++)
+		if (mapped_ppa(&tp_buf[i]))
+			want++;
+	if (want == 0)
+		return NULL;
+
+	/* entry 슬롯 공간 확보(node 단위 evict, 한 번에 최대 ents개 회수). node를 아직
+	 * 만들지 않았으므로 evict가 우리 것을 건드릴 일은 없다. */
+	while (cmt->entry_size + want > cmt->entry_capacity)
+		cmt_evict_node(conv_ftl, stime);
+
+	node = list_first_entry(&cmt->node_free_list, struct tp_node, lru);
+	list_del(&node->lru);
+	node->tp_idx = tp_idx;
+	node->entry_count = 0;
+	node->dirty_count = 0;
+	INIT_LIST_HEAD(&node->entries);
+	hash_add(cmt->node_ht, &node->hnode, tp_idx);
+	list_add(&node->lru, &cmt->node_lru);
+	cmt->node_size++;
+
+	for (i = 0; i < ents; i++) {
+		struct cmt_entry *e;
+
+		if (!mapped_ppa(&tp_buf[i]))
+			continue;
+		e = cmt_attach_entry(cmt, node, base_lpn + i, tp_buf[i], false);
+		if (base_lpn + i == target_lpn)
+			target = e;
+	}
+	return target;
+}
+#endif /* CMT_FILL_TP */
 
 static struct ppa tp_load(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t *stime)
 {
@@ -1183,9 +1305,14 @@ static struct ppa dftl_get_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, uint64_t
 
 	/* prediction unavailable/failed: read translation page and cache it */
 	ppa = tp_load(conv_ftl, lpn, stime);
+#if CMT_FILL_TP
+	(void)ppa; /* TP-fill은 tp_map에서 통째로 읽으므로 tp_load 반환 ppa는 미사용 */
+	cmt_fill_tp(conv_ftl, lpn / ents, lpn, stime);
+#else
 	cmt_insert(conv_ftl, lpn, ppa, false, stime);
+#endif
 
-	/* cmt_insert() may evict a dirty entry and flush its TPnode; that writeback
+	/* cmt fill may evict a dirty entry and flush its TPnode; that writeback
 	 * (tp_flush_idx)
 	 * consumes a write credit which can trigger a foreground GC *re-entrantly*.
 	 * Such a GC can relocate THIS lpn and erase the page tp_load() just returned,
@@ -1296,8 +1423,23 @@ static void dftl_set_ppa(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa ppa
 		return;
 	}
 
-	/* CMT miss: TP를 읽어올 필요 없이 바로 dirty로 삽입 */
+	/* CMT miss */
+#if CMT_FILL_TP
+	/* TP-fill: tp_map엔 위에서 새 ppa가 write-through됐다. 그 TP를 통째로 캐시(이미 캐시돼
+	 * 있으면 이 target만 보충)한 뒤 해당 entry를 dirty로 승격해 read/write fill 단위를 TP로
+	 * 통일한다. */
+	{
+		struct cmt_entry *t = cmt_fill_tp(conv_ftl, lpn / ents, lpn, stime);
+
+		if (t && !t->dirty) {
+			t->dirty = true;
+			t->parent->dirty_count++;
+		}
+	}
+#else
+	/* entry-fill: TP를 읽어올 필요 없이 바로 dirty entry 하나 삽입 */
 	cmt_insert(conv_ftl, lpn, ppa, true, stime);
+#endif
 }
 
 /*
@@ -1417,7 +1559,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	ssd_init_params(&spp, size, nr_parts);
 	conv_init_params(&cpp);
 
-	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
+	conv_ftls = vzalloc(sizeof(*conv_ftls) * nr_parts);
 
 	for (i = 0; i < nr_parts; i++) {
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
@@ -1529,7 +1671,7 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 		kfree(conv_ftls[i].ssd);
 	}
 
-	kfree(conv_ftls);
+	vfree(conv_ftls);
 	ns->ftls = NULL;
 }
 
