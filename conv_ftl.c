@@ -1400,7 +1400,7 @@ static void conv_init_params(struct convparams *cpp)
 	 * 2줄로는 부족해 free line이 고갈된다(NULL deref). */
 	cpp->gc_thres_lines = 4;
 	cpp->gc_thres_lines_high = 4;
-	cpp->enable_gc_delay = 1;
+	cpp->enable_gc_delay = 0;
 	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100);
 }
 
