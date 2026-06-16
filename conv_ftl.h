@@ -230,8 +230,11 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 /* background GC kthread entry; data = struct nvmev_gc_worker * */
 int nvmev_gc_fn(void *data);
 
-/* Read-path hit counters, surfaced/reset via /proc/nvmev/cmt_stat */
+/* Read-path hit counters, surfaced/reset via /proc/nvmev/learnedFTL */
 void conv_cmt_stat_read(uint64_t *access, uint64_t *hit, uint64_t *miss);
 void conv_cmt_stat_reset(void);
+/* LR model counters, surfaced alongside CMT stats via /proc/nvmev/learnedFTL */
+void conv_lr_stat_read(uint64_t *trains, uint64_t *bits_set, uint64_t *uses,
+		       uint64_t *hits, uint64_t *si);
 
 #endif

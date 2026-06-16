@@ -31,7 +31,7 @@ static atomic64_t gc_fallback = ATOMIC64_INIT(0); /* do_gc passes that fell back
 static atomic64_t host_writes = ATOMIC64_INIT(
 	0); /* host data page writes; WA = (host_writes + gc_reloc_pages) / host_writes */
 
-/* Runtime read-path counters for /proc/nvmev/cmt_stat. access = CMT hit + miss.
+/* Runtime read-path counters for /proc/nvmev/learnedFTL. access = CMT hit + miss.
  * Reading reports CMT stats; writing resets the per-phase CMT and LR model use/hit
  * counters so one benchmark phase can be measured in isolation. These touch only
  * diagnostic counters, so they never affect mapping/GC behavior. */
@@ -51,6 +51,18 @@ void conv_cmt_stat_reset(void)
 	atomic64_set(&cmt_misses, 0);
 	atomic64_set(&model_uses, 0);
 	atomic64_set(&model_hits, 0);
+}
+
+/* LR model counters, surfaced alongside CMT stats via /proc/nvmev/learnedFTL.
+ * Diagnostic only; never affects mapping/GC behavior. */
+void conv_lr_stat_read(uint64_t *trains, uint64_t *bits_set, uint64_t *uses,
+		       uint64_t *hits, uint64_t *si)
+{
+	*trains = atomic64_read(&model_trains);
+	*bits_set = atomic64_read(&model_bits_set);
+	*uses = atomic64_read(&model_uses);
+	*hits = atomic64_read(&model_hits);
+	*si = atomic64_read(&si_installs);
 }
 
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
