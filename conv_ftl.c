@@ -1149,11 +1149,12 @@ static void cmt_evict_node(struct conv_ftl *conv_ftl, uint64_t *stime)
 
 /*
  * TP-granular fill: CMT miss가 난 lpn이 속한 translation page `tp_idx` 한 장을 통째로
- * 캐시한다. tp_map은 write-through라 늘 최신이므로 NAND를 다시 읽지 않고 거기서 mapped
- * entry를 전부 읽어 새 TP node 하나에 clean으로 올린다(같은 TP 안 인접 lpn 재접근의
- * translation read 제거). evict가 node 단위라 "node가 있으면 그 시점 mapped entry가 전부
- * 캐시됨"이 불변식 — 이미 node가 있는데 들어온 경우는 UNMAPPED였다가 방금 처음 mapped된
- * target 하나만 보충한다. target_lpn의 entry 포인터를 반환(캐시할 게 없으면 NULL).
+ * 캐시한다. tp_map은 write-through라 늘 최신이므로 NAND를 다시 읽지 않고 거기서 TP의 entry
+ * 512개를 unmapped 슬롯까지 전부 읽어 새 TP node 하나에 clean으로 올린다(같은 TP 안 인접 lpn
+ * 재접근의 translation read 제거 + unmapped lpn 접근도 entry-hit으로 흡수). evict가 node
+ * 단위라 "node가 있으면 그 TP의 모든 slot(mapped+unmapped) entry가 전부 캐시됨"이 불변식 —
+ * node가 이미 있으면 보충 없이 기존 target entry만 반환한다. 전부 unmapped라 올릴 게 없는
+ * TP는 캐시하지 않는다. target_lpn의 entry 포인터를 반환(캐시할 게 없으면 NULL).
  */
 static struct cmt_entry *cmt_fill_tp(struct conv_ftl *conv_ftl, uint32_t tp_idx,
 				     uint64_t target_lpn, uint64_t *stime)
@@ -1165,30 +1166,35 @@ static struct cmt_entry *cmt_fill_tp(struct conv_ftl *conv_ftl, uint32_t tp_idx,
 	uint64_t base_lpn = (uint64_t)tp_idx * ents;
 	struct tp_node *node = node_lookup(cmt, tp_idx);
 	struct cmt_entry *target = NULL;
-	uint32_t i, want = 0;
+	uint32_t i;
+	bool any_mapped = false;
 
 	if (node) {
-		/* 이미 통째 캐시됨 → MRU로 올리고 빠진 target 하나만 보충.
-		 * (read의 UNMAPPED target은 캐시할 게 없으므로 건너뛴다.) */
+		/* 이미 TP 전체(unmapped 포함)가 캐시됨 → MRU로 올리고 기존 target entry 반환.
+		 * full-fill 불변식상 모든 slot의 entry가 존재하므로 보충(attach)은 필요 없다. */
+		struct cmt_entry *e;
+
 		list_move(&node->lru, &cmt->node_lru);
-		if (!mapped_ppa(&tp_buf[target_lpn - base_lpn]))
-			return NULL;
-		if (cmt->entry_size + 1 > cmt->entry_capacity)
-			cmt_evict_node(conv_ftl, stime); /* node는 MRU라 evict 대상 아님 */
-		return cmt_attach_entry(cmt, node, target_lpn,
-					tp_buf[target_lpn - base_lpn], false);
+		list_for_each_entry(e, &node->entries, sibling)
+			if (e->lpn == target_lpn)
+				return e;
+		return NULL;
 	}
 
-	/* TP가 캐시에 없음 → mapped entry를 모두 통째로 올린다 */
-	for (i = 0; i < ents; i++)
-		if (mapped_ppa(&tp_buf[i]))
-			want++;
-	if (want == 0)
+	/* TP가 캐시에 없음 → mapped entry가 하나라도 있으면 unmapped 슬롯까지 포함해 TP 전체를
+	 * 올린다. 전부 unmapped라 올릴 내용이 없는 TP는 건너뛴다. */
+	for (i = 0; i < ents; i++) {
+		if (mapped_ppa(&tp_buf[i])) {
+			any_mapped = true;
+			break;
+		}
+	}
+	if (!any_mapped)
 		return NULL;
 
-	/* entry 슬롯 공간 확보(node 단위 evict, 한 번에 최대 ents개 회수). node를 아직
-	 * 만들지 않았으므로 evict가 우리 것을 건드릴 일은 없다. */
-	while (cmt->entry_size + want > cmt->entry_capacity)
+	/* TP 전체(ents개)를 캐시하므로 entry 슬롯도 ents개를 확보(node 단위 evict, 한 번에 최대
+	 * ents개 회수). node를 아직 만들지 않았으므로 evict가 우리 것을 건드릴 일은 없다. */
+	while (cmt->entry_size + ents > cmt->entry_capacity)
 		cmt_evict_node(conv_ftl, stime);
 
 	node = list_first_entry(&cmt->node_free_list, struct tp_node, lru);
@@ -1204,8 +1210,6 @@ static struct cmt_entry *cmt_fill_tp(struct conv_ftl *conv_ftl, uint32_t tp_idx,
 	for (i = 0; i < ents; i++) {
 		struct cmt_entry *e;
 
-		if (!mapped_ppa(&tp_buf[i]))
-			continue;
 		e = cmt_attach_entry(cmt, node, base_lpn + i, tp_buf[i], false);
 		if (base_lpn + i == target_lpn)
 			target = e;

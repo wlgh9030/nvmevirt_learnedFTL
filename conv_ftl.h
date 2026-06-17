@@ -24,8 +24,8 @@
  * phase does no training), so the on/off IOPS delta is exactly the read-path benefit. */
 #define LEARNED_INDEX_ENABLE 1
 /* CMT fill granularity A/B switch (DFTL CMT 관리 단위):
- * 1 = translation-page granular: CMT miss 시 그 TP 1장의 mapped entry(<=512)를 통째로
- *     캐시하고 evict도 TP node 단위. 같은 TP 안 인접 lpn 재접근의 NAND translation read를
+ * 1 = translation-page granular: CMT miss 시 그 TP 1장의 entry 512개를 unmapped 슬롯까지
+ *     통째로 캐시하고 evict도 TP node 단위. 같은 TP 안 인접 lpn 재접근의 NAND translation read를
  *     없앤다(DFTL 정석). 0 = entry granular: miss 시 요청 lpn 1개만 캐시/evict(fine-grained).
  * 두 모드 모두 CMT_CAPACITY entry 슬롯이라는 동일 메모리 예산을 공유하므로 fill 단위만
  * 격리 비교된다. LEARNED_INDEX_ENABLE과 직교 — model_predict가 흡수 못 한 miss에만 작동. */
