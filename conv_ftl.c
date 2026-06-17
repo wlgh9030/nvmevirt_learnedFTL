@@ -1258,7 +1258,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			if (last_pg_in_wordline(conv_ftl, &ppa)) {
 				swr.ppa = &ppa;
 
-				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
+				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &tp_stime[part]);
 				nsecs_latest = max(nsecs_completed, nsecs_latest);
 
 				schedule_internal_operation(req->sq_id, nsecs_completed, wbuf,
