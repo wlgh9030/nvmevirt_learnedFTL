@@ -885,9 +885,10 @@ static struct tp_node *node_lookup(struct dftl_cmt *cmt, uint32_t tp_idx)
 /*
  * Flush translation page `tp_idx` to NAND. The page content is already current
  * in tp_map (write-through via dftl_set_ppa / dftl_set_ppa_gc), so no entry copy
- * is needed — this only models the read-modify-write + NAND write latency, moves
- * the TP to a new physical page, and updates the GTD. If the TP is cached
- * (`node` != NULL), the whole page is now persisted so its entries become clean.
+ * is needed — this models the NAND write latency, moves the TP to a new physical
+ * page, and updates the GTD. If the TP is cached (`node` != NULL), the whole TP
+ * is reconstructable from the CMT node, so the RMW read is skipped (it would
+ * overcount vs. real hardware) and its entries become clean once persisted.
  */
 static void tp_flush_idx(struct conv_ftl *conv_ftl, uint32_t tp_idx, struct tp_node *node,
 			 uint64_t *stime)
@@ -911,17 +912,24 @@ static void tp_flush_idx(struct conv_ftl *conv_ftl, uint32_t tp_idx, struct tp_n
 	advance_write_pointer(conv_ftl, &conv_ftl->trans_wp);
 
 	if (mapped_ppa(&old_tp_ppa)) {
-		/* 기존 TP read 지연 시뮬레이션 (read-modify-write) */
-		cmd = (struct nand_cmd){
-			.type = GC_IO,
-			.cmd = NAND_READ,
-			.stime = nsecs_latest,
-			.xfer_size = spp->pgsz,
-			.interleave_pci_dma = false,
-			.ppa = &old_tp_ppa,
-		};
-		nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
-		nsecs_latest = max(nsecs_completed, nsecs_latest);
+		/* RMW read 지연은 TP가 캐시돼 있지 않을 때(node == NULL)만 부과한다.
+		 * CMT_FILL_TP에서 node가 있으면 그 TP의 mapped entry가 전부 캐시돼 있고
+		 * (unmapped는 NAND에서도 UNMAPPED), tp_map은 write-through라 CMT node
+		 * 하나만으로 완전한 TP page를 재구성할 수 있다 → old TP를 다시 읽을 필요가
+		 * 없다. 이 경우 NAND_READ를 부과하면 실제 하드웨어 DFTL보다 과대계상이 된다. */
+		if (!node) {
+			/* 기존 TP read 지연 시뮬레이션 (read-modify-write) */
+			cmd = (struct nand_cmd){
+				.type = GC_IO,
+				.cmd = NAND_READ,
+				.stime = nsecs_latest,
+				.xfer_size = spp->pgsz,
+				.interleave_pci_dma = false,
+				.ppa = &old_tp_ppa,
+			};
+			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &cmd);
+			nsecs_latest = max(nsecs_completed, nsecs_latest);
+		}
 
 		/* 기존 페이지 무효화 */
 		mark_page_invalid(conv_ftl, &old_tp_ppa);
